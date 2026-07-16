@@ -1,50 +1,51 @@
 # syntax=docker/dockerfile:1
-# Build waypipe for Linux from the same pinned upstream commit + macOS-portability
-# patch as the host side (scripts/build-waypipe.sh), so both ends run the identical
-# waypipe revision and the wire versions stay in lock-step. Then assemble a slim
-# runtime image with a GNOME app + the transport bridge.
+# Alpine-based runtime — much newer GNOME (50) than Debian trixie. waypipe is
+# built for musl from the same pinned upstream commit + macOS-portability patch as
+# the host side (scripts/build-waypipe.sh), so both ends run the identical revision
+# and the wire versions stay in lock-step.
 
-FROM rust:trixie AS waypipe-build
+FROM rust:alpine AS waypipe-build
 # Keep in sync with scripts/build-waypipe.sh.
 ARG WAYPIPE_REPO=https://gitlab.freedesktop.org/mstoeckl/waypipe.git
 ARG WAYPIPE_COMMIT=1ac039b4d50e2658d284e750c182266cc00efe74
+RUN apk add --no-cache git build-base
 WORKDIR /build
 RUN git clone "$WAYPIPE_REPO" . && git checkout --quiet "$WAYPIPE_COMMIT"
 # The patch is macOS-cfg-gated, so it's a no-op for the Linux build's behavior;
 # applying it anyway keeps "both ends build the same source" literally true.
 COPY waypipe-macos.patch /tmp/waypipe-macos.patch
 RUN git apply /tmp/waypipe-macos.patch
-# Match the macOS build's feature set (no lz4/zstd/dmabuf) so the two ends agree;
-# the wire uses uncompressed frames (-c none).
-# BuildKit cache mounts persist the cargo registry and target dir across builds.
-# (The final binary is copied out within this same RUN, before the mount detaches.)
+# Match the macOS build's feature set (no lz4/zstd/dmabuf); the wire uses
+# uncompressed frames (-c none). BuildKit cache mounts persist the registry/target.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --no-default-features --release \
     && cp target/release/waypipe /usr/local/bin/waypipe
 
-FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        socat \
-        dbus dbus-x11 \
-        gnome \
-        weston \
-        fonts-dejavu-core \
-        adwaita-icon-theme hicolor-icon-theme gnome-icon-theme \
-        librsvg2-common \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-# librsvg2-common's postinst registers the SVG pixbuf loader (for scalable/HD
-# icons) and updates the loader cache automatically — no env override needed
-# (a hardcoded path would be wrong on arm64 anyway).
+FROM alpine:edge
+# The GNOME apps live in community/testing on edge.
+RUN printf '%s\n' \
+      https://dl-cdn.alpinelinux.org/alpine/edge/main \
+      https://dl-cdn.alpinelinux.org/alpine/edge/community \
+      https://dl-cdn.alpinelinux.org/alpine/edge/testing \
+      > /etc/apk/repositories \
+ && apk add --no-cache \
+      bash socat \
+      dbus dbus-x11 \
+      gnome-console gnome \
+      gtk4.0 \
+      gdk-pixbuf librsvg \
+      adwaita-icon-theme hicolor-icon-theme \
+      gsettings-desktop-schemas dconf \
+      font-dejavu \
+ && dbus-uuidgen --ensure=/etc/machine-id
 
 COPY --from=waypipe-build /usr/local/bin/waypipe /usr/local/bin/waypipe
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# GTK renders into shm buffers (no GPU) via the cairo renderer.
-# A UTF-8 locale is required by some apps (e.g. gnome-terminal refuses to start
-# under the default ASCII C locale); glibc ships C.UTF-8 built-in.
+# GTK renders into shm buffers (no GPU) via the cairo renderer. musl is UTF-8
+# natively but some apps still check LANG.
 ENV GDK_BACKEND=wayland \
     GSK_RENDERER=cairo \
     LIBGL_ALWAYS_SOFTWARE=1 \

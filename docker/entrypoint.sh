@@ -52,6 +52,9 @@ done
 
 echo "[container] bridging unix ${SOCK}  ->  tcp ${HOST}:${PORT}"
 rm -f "$SOCK"
+# `fork`: waypipe may open more than one transport connection, so the bridge must
+# keep accepting (a single-connection socat would ECONNREFUSED the rest). Teardown
+# is driven by the app process exiting (below), not by socat.
 socat "UNIX-LISTEN:${SOCK},reuseaddr,fork" "TCP:${HOST}:${PORT}" &
 pids+=($!)
 
@@ -61,20 +64,31 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 
-echo "[container] launching via waypipe: ${APP}"
-# waypipe server connects to $SOCK, spawns the app, and forwards its Wayland
-# traffic (buffers serialized inline, so no fd-passing crosses the boundary).
-#
-# The app is launched through a small shim that first runs
-# dbus-update-activation-environment: waypipe sets WAYLAND_DISPLAY only after the
-# session bus (from dbus-run-session) is already up, so D-Bus-activated services
-# (e.g. gnome-terminal-server) would otherwise start without WAYLAND_DISPLAY and
-# fail with "Cannot open display". Pushing the env into the bus's activation set
-# fixes that; it's a harmless no-op for apps that don't use D-Bus activation.
-dbus-run-session -- waypipe -c none --no-gpu -s "$SOCK" server -- \
+# Run waypipe as a display SERVER that exposes a NAMED socket
+# ($XDG_RUNTIME_DIR/wayland-0) rather than spawning the app itself. This is the
+# crucial bit: if you pass `server -- app`, waypipe hands that one process the
+# display as an inherited fd (WAYLAND_SOCKET), so the shell it spawns and any
+# child/D-Bus-activated program get no display ("Cannot open display"). A named
+# socket lets EVERY client — the app, its shell, launched programs, and activated
+# helpers — connect via WAYLAND_DISPLAY. (No --oneshot: several clients connect.)
+echo "[container] starting waypipe display server (wayland-0)"
+waypipe -c none --no-gpu --display wayland-0 -s "$SOCK" server &
+pids+=($!)
+for _ in $(seq 1 100); do
+    [ -S "$XDG_RUNTIME_DIR/wayland-0" ] && break
+    sleep 0.1
+done
+export WAYLAND_DISPLAY=wayland-0
+
+echo "[container] launching: ${APP}"
+# dbus-run-session inherits WAYLAND_DISPLAY (set above), so the session bus and
+# every D-Bus-activated service get it too. The shim additionally pushes the env
+# into the bus's activation set as belt-and-suspenders.
+dbus-run-session -- \
     bash -c 'dbus-update-activation-environment --all >/dev/null 2>&1 || true; exec "$@"' _ ${APP} &
 pids+=($!)
 
-# Block until the first child exits, then let the EXIT trap stop everything.
+# Block until the first child exits (the app quitting, or the socat bridge
+# dropping when the macOS side goes away), then let the EXIT trap stop everything.
 wait -n
 shutdown $?
