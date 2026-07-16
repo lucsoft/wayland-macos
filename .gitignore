@@ -1,0 +1,21 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# waypipe client: built from docker/waypipe-macos.patch by scripts/build-waypipe.sh
+/bin/waypipe-macos
+/.waypipe-build/
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
+.AppleDouble
+._*
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*~

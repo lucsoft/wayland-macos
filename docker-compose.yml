@@ -1,0 +1,18 @@
+# The container running the native Linux Wayland app + waypipe.
+# The macOS side (compositor + waypipe client + TCP bridge) is started by
+# scripts/mac-side.sh — see README.
+services:
+  wayland-app:
+    build:
+      context: ./docker
+    image: wayland-macos-app
+    environment:
+      MAC_HOST: host.docker.internal
+      BRIDGE_PORT: "7777"
+      # Any installed Wayland app: gnome-text-editor, gnome-calculator,
+      # weston-simple-shm (pure-shm sanity check), weston-terminal, ...
+      APP: "gnome-text-editor"
+    # host.docker.internal resolves automatically on Docker Desktop; this mapping
+    # is a safety net for other setups.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

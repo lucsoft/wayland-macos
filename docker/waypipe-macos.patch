@@ -1,0 +1,367 @@
+# waypipe macOS-portability patch.
+# Base: gitlab.freedesktop.org/mstoeckl/waypipe @ 1ac039b4d50e2658d284e750c182266cc00efe74
+# Apply with: git apply waypipe-macos.patch   (see scripts/build-waypipe.sh)
+diff --git a/src/compat.rs b/src/compat.rs
+new file mode 100644
+index 0000000..9efe640
+--- /dev/null
++++ b/src/compat.rs
+@@ -0,0 +1,153 @@
++//! Small portability shim so waypipe's client side builds on macOS (Darwin),
++//! which lacks `memfd_create`, `pipe2`, and `ppoll`. These implementations are
++//! cross-platform (they also work on Linux) and only cover what waypipe uses.
++
++use nix::errno::Errno;
++use nix::fcntl::OFlag;
++use nix::poll::{PollFd, PollTimeout};
++use nix::sys::signal::SigSet;
++use nix::sys::time::TimeSpec;
++use std::ffi::CStr;
++use std::os::fd::{FromRawFd, OwnedFd};
++
++/// Anonymous, resizable, mmap-able fd. On Linux waypipe uses `memfd_create`;
++/// here we open a regular file and immediately `unlink` it. Crucially this must
++/// be a regular file, NOT a POSIX shm object: macOS `shm_open` objects can only
++/// be sized once, and waypipe grows buffers with `ftruncate` (e.g. when a client
++/// resizes an shm pool), which would fail with EINVAL on shm.
++pub fn memfd_create(_name: &CStr) -> nix::Result<OwnedFd> {
++    use std::sync::atomic::{AtomicU32, Ordering};
++    static CTR: AtomicU32 = AtomicU32::new(0);
++    let n = CTR.fetch_add(1, Ordering::Relaxed);
++    let pid = unsafe { nix::libc::getpid() };
++    let dir = std::env::var("XDG_RUNTIME_DIR")
++        .or_else(|_| std::env::var("TMPDIR"))
++        .unwrap_or_else(|_| "/tmp".to_string());
++    let path = format!("{dir}/wp-{pid}-{n}\0");
++    let cpath = path.as_ptr() as *const nix::libc::c_char;
++    let fd = unsafe {
++        nix::libc::open(
++            cpath,
++            nix::libc::O_RDWR | nix::libc::O_CREAT | nix::libc::O_EXCL,
++            0o600,
++        )
++    };
++    if fd < 0 {
++        return Err(Errno::last());
++    }
++    // Detach the name; the fd stays valid and the file is freed on last close.
++    unsafe { nix::libc::unlink(cpath) };
++    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
++}
++
++/// `pipe2` replacement: `pipe()` followed by explicit flag setting.
++pub fn pipe2(flags: OFlag) -> nix::Result<(OwnedFd, OwnedFd)> {
++    use std::os::fd::AsRawFd;
++    let mut fds = [0 as nix::libc::c_int; 2];
++    if unsafe { nix::libc::pipe(fds.as_mut_ptr()) } != 0 {
++        return Err(Errno::last());
++    }
++    let r = unsafe { OwnedFd::from_raw_fd(fds[0]) };
++    let w = unsafe { OwnedFd::from_raw_fd(fds[1]) };
++    for fd in [r.as_raw_fd(), w.as_raw_fd()] {
++        if flags.contains(OFlag::O_CLOEXEC) {
++            let cur = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) };
++            unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFD, cur | nix::libc::FD_CLOEXEC) };
++        }
++        if flags.contains(OFlag::O_NONBLOCK) {
++            let cur = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
++            unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFL, cur | nix::libc::O_NONBLOCK) };
++        }
++    }
++    Ok((r, w))
++}
++
++/// `ppoll` replacement built on `poll`. The atomic signal-mask swap is dropped
++/// (macOS has no `ppoll`); waypipe also uses a self-pipe to wake on signals, so
++/// this is adequate for the client side. waypipe only ever calls it with a
++/// `None` (block) or zero timeout.
++pub fn ppoll(
++    fds: &mut [PollFd],
++    timeout: Option<TimeSpec>,
++    _sigmask: Option<SigSet>,
++) -> nix::Result<nix::libc::c_int> {
++    let to = match timeout {
++        None => PollTimeout::NONE,
++        Some(ts) => {
++            let ms = (ts.tv_sec() as i64) * 1000 + (ts.tv_nsec() as i64) / 1_000_000;
++            u16::try_from(ms.max(0)).map(PollTimeout::from).unwrap_or(PollTimeout::MAX)
++        }
++    };
++    nix::poll::poll(fds, to)
++}
++
++/// Client-side macOS build does not fork the application, so there are no child
++/// processes to reap; `waitid(P_ALL, WNOWAIT)` (unavailable in nix on macOS) is
++/// emulated as "nothing changed".
++pub fn reap_any() -> nix::Result<nix::sys::wait::WaitStatus> {
++    Ok(nix::sys::wait::WaitStatus::StillAlive)
++}
++
++/// Drop-in for `nix::sys::socket` that supplies the `SOCK_CLOEXEC` /
++/// `SOCK_NONBLOCK` flags macOS lacks by applying them via `fcntl` after
++/// `socket()`/`socketpair()`.
++pub mod sock {
++    pub use nix::sys::socket::*;
++    use nix::sys::socket::SockFlag as NixSockFlag;
++    use std::os::fd::{AsRawFd, OwnedFd, RawFd};
++
++    #[derive(Clone, Copy, PartialEq, Eq)]
++    pub struct SockFlag(pub i32);
++
++    impl SockFlag {
++        pub const SOCK_CLOEXEC: SockFlag = SockFlag(1);
++        pub const SOCK_NONBLOCK: SockFlag = SockFlag(2);
++        pub fn empty() -> SockFlag {
++            SockFlag(0)
++        }
++        pub fn contains(self, other: SockFlag) -> bool {
++            (self.0 & other.0) == other.0
++        }
++    }
++
++    impl std::ops::BitOr for SockFlag {
++        type Output = SockFlag;
++        fn bitor(self, other: SockFlag) -> SockFlag {
++            SockFlag(self.0 | other.0)
++        }
++    }
++
++    fn apply(fd: RawFd, flags: SockFlag) {
++        if flags.contains(SockFlag::SOCK_CLOEXEC) {
++            let cur = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) };
++            unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFD, cur | nix::libc::FD_CLOEXEC) };
++        }
++        if flags.contains(SockFlag::SOCK_NONBLOCK) {
++            let cur = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
++            unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFL, cur | nix::libc::O_NONBLOCK) };
++        }
++    }
++
++    pub fn socket<T: Into<Option<SockProtocol>>>(
++        domain: AddressFamily,
++        ty: SockType,
++        flags: SockFlag,
++        protocol: T,
++    ) -> nix::Result<OwnedFd> {
++        let fd = nix::sys::socket::socket(domain, ty, NixSockFlag::empty(), protocol)?;
++        apply(fd.as_raw_fd(), flags);
++        Ok(fd)
++    }
++
++    pub fn socketpair<T: Into<Option<SockProtocol>>>(
++        domain: AddressFamily,
++        ty: SockType,
++        protocol: T,
++        flags: SockFlag,
++    ) -> nix::Result<(OwnedFd, OwnedFd)> {
++        let (a, b) = nix::sys::socket::socketpair(domain, ty, protocol, NixSockFlag::empty())?;
++        apply(a.as_raw_fd(), flags);
++        apply(b.as_raw_fd(), flags);
++        Ok((a, b))
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index 998f8dd..536c4c8 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -5,7 +5,8 @@ use log::{debug, error, Log, Record};
+ use nix::errno::Errno;
+ use nix::libc;
+ use nix::poll::{PollFd, PollFlags};
+-use nix::sys::{signal, socket, stat, wait};
++use nix::sys::{signal, stat, wait};
++use mainloop::compat::sock as socket;
+ use nix::{fcntl, unistd};
+ use std::collections::BTreeMap;
+ use std::env;
+@@ -1333,12 +1334,7 @@ fn run_server_inner(
+     loop {
+         loop {
+             /* Handle any child process exits */
+-            let res = wait::waitid(
+-                wait::Id::All,
+-                wait::WaitPidFlag::WEXITED
+-                    | wait::WaitPidFlag::WNOHANG
+-                    | wait::WaitPidFlag::WNOWAIT,
+-            );
++            let res = compat::reap_any();
+             match res {
+                 Ok(status) => {
+                     let opid = match status {
+@@ -1407,7 +1403,7 @@ fn run_server_inner(
+             pfds_base.as_mut().unwrap()
+         };
+ 
+-        let res = nix::poll::ppoll(pfds, None, Some(pollmask));
++        let res = compat::ppoll(pfds, None, Some(pollmask));
+         if let Err(errno) = res {
+             assert!(errno == Errno::EINTR || errno == Errno::EAGAIN);
+             continue;
+@@ -1668,12 +1664,7 @@ fn run_client_inner(
+     'outer: loop {
+         /* Handle any child process exits (including the case where cmd_child exited immediately)*/
+         loop {
+-            let res = wait::waitid(
+-                wait::Id::All,
+-                wait::WaitPidFlag::WEXITED
+-                    | wait::WaitPidFlag::WNOHANG
+-                    | wait::WaitPidFlag::WNOWAIT,
+-            );
++            let res = compat::reap_any();
+             match res {
+                 Ok(status) => match status {
+                     wait::WaitStatus::Exited(pid, _code) => {
+@@ -1716,7 +1707,7 @@ fn run_client_inner(
+ 
+         /* Wait for SIGCHLD or socket connection */
+         let mut pfds = [PollFd::new(channel_socket.as_fd(), PollFlags::POLLIN)];
+-        let res = nix::poll::ppoll(&mut pfds, None, Some(pollmask));
++        let res = compat::ppoll(&mut pfds, None, Some(pollmask));
+         if let Err(errno) = res {
+             assert!(errno == Errno::EINTR || errno == Errno::EAGAIN);
+             continue;
+@@ -1899,7 +1890,7 @@ fn setup_secctx(
+     fcntl::fcntl(&wayland_conn, fcntl::FcntlArg::F_SETFL(flags))
+         .map_err(|x| tag!("Failed to set wayland socket flags: {}", x))?;
+ 
+-    let (close_r, close_w) = unistd::pipe2(fcntl::OFlag::O_CLOEXEC | fcntl::OFlag::O_NONBLOCK)
++    let (close_r, close_w) = compat::pipe2(fcntl::OFlag::O_CLOEXEC | fcntl::OFlag::O_NONBLOCK)
+         .map_err(|x| tag!("Failed to create pipe: {:?}", x))?;
+ 
+     secctx::provide_secctx(wayland_conn, app_id, sock, close_r)?;
+diff --git a/src/mainloop.rs b/src/mainloop.rs
+index 6439efa..f37a036 100644
+--- a/src/mainloop.rs
++++ b/src/mainloop.rs
+@@ -1,5 +1,6 @@
+ /* SPDX-License-Identifier: GPL-3.0-or-later */
+ /*! Logic and organization to proxy a single Wayland connection */
++pub mod compat;
+ pub mod compress;
+ pub mod damage;
+ pub mod dmabuf;
+@@ -37,7 +38,7 @@ use nix::errno::Errno;
+ use nix::fcntl;
+ use nix::libc;
+ use nix::poll::{PollFd, PollFlags};
+-use nix::sys::{memfd, signal, socket, time, uio};
++use nix::sys::{signal, socket, time, uio};
+ use nix::unistd;
+ use std::cell::RefCell;
+ use std::collections::{BTreeMap, BTreeSet, VecDeque};
+@@ -1394,10 +1395,7 @@ fn process_sfd_msg(
+             // todo: handle error
+             let size = i32::from_le_bytes(msg[8..12].try_into().unwrap());
+ 
+-            let local_fd = memfd::memfd_create(
+-                c"/waypipe",
+-                memfd::MFdFlags::MFD_CLOEXEC | memfd::MFdFlags::MFD_ALLOW_SEALING,
+-            )
++            let local_fd = crate::compat::memfd_create(c"/waypipe")
+             .map_err(|x| tag!("Failed to create memfd: {:?}", x))?;
+ 
+             unistd::ftruncate(&local_fd, size as libc::off_t)
+@@ -1882,7 +1880,7 @@ fn process_sfd_msg(
+ 
+         WmsgType::OpenIRPipe | WmsgType::OpenIWPipe => {
+             let (pipe_r, pipe_w) =
+-                unistd::pipe2(fcntl::OFlag::O_CLOEXEC | fcntl::OFlag::O_NONBLOCK)
++                crate::compat::pipe2(fcntl::OFlag::O_CLOEXEC | fcntl::OFlag::O_NONBLOCK)
+                     .map_err(|x| tag!("Failed to create pipe: {:?}", x))?;
+ 
+             let (local_pipe, export_pipe) = if typ == WmsgType::OpenIRPipe {
+@@ -4793,7 +4791,7 @@ fn loop_inner<'a>(
+                             w.notify.notify_all();
+                         } else {
+                             let (wake_r, wake_w) =
+-                                unistd::pipe2(fcntl::OFlag::O_CLOEXEC | fcntl::OFlag::O_NONBLOCK)
++                                crate::compat::pipe2(fcntl::OFlag::O_CLOEXEC | fcntl::OFlag::O_NONBLOCK)
+                                     .map_err(|x| tag!("Failed to create pipe: {}", x))?;
+ 
+                             let wait_state = Arc::new(VulkanWaitThread {
+@@ -4939,7 +4937,7 @@ fn loop_inner<'a>(
+         }
+ 
+         let zero_timeout = time::TimeSpec::new(0, 0);
+-        let res = nix::poll::ppoll(
++        let res = crate::compat::ppoll(
+             &mut pfds,
+             if work_to_do_now {
+                 Some(zero_timeout)
+@@ -5486,7 +5484,7 @@ fn loop_end_to_channel(
+     while has_from_way_output(&from_way.output) || nwritten_err < endmsg.len() {
+         let mut pfds = [PollFd::new(chanfd.as_fd(), PollFlags::POLLOUT)];
+ 
+-        let res = nix::poll::ppoll(&mut pfds, None, Some(*pollmask));
++        let res = crate::compat::ppoll(&mut pfds, None, Some(*pollmask));
+ 
+         if let Err(errno) = res {
+             assert!(errno == Errno::EINTR || errno == Errno::EAGAIN);
+@@ -5547,7 +5545,7 @@ fn loop_error_to_wayland(
+     while has_from_chan_output(&from_chan.output) || nwritten_err < errmsg_len {
+         let mut pfds = [PollFd::new(progfd.as_fd(), PollFlags::POLLOUT)];
+ 
+-        let res = nix::poll::ppoll(&mut pfds, None, Some(*pollmask));
++        let res = crate::compat::ppoll(&mut pfds, None, Some(*pollmask));
+ 
+         if let Err(errno) = res {
+             assert!(errno == Errno::EINTR || errno == Errno::EAGAIN);
+@@ -5720,7 +5718,7 @@ pub fn main_interface_loop(
+         has_first_message: false,
+         has_received_close: false,
+     };
+-    let (wake_r, wake_w) = unistd::pipe2(fcntl::OFlag::O_CLOEXEC | fcntl::OFlag::O_NONBLOCK)
++    let (wake_r, wake_w) = crate::compat::pipe2(fcntl::OFlag::O_CLOEXEC | fcntl::OFlag::O_NONBLOCK)
+         .map_err(|x| tag!("Failed to create pipe: {}", x))?;
+ 
+     let tasksys = TaskSystem {
+diff --git a/src/platform.rs b/src/platform.rs
+index 43e6bc5..cf085d4 100644
+--- a/src/platform.rs
++++ b/src/platform.rs
+@@ -74,7 +74,7 @@ fn get_rdev_for_file_base(path: &Path) -> Option<u64> {
+     /* st_rdev size varies by platform and may be 4 on old
+      * architectures, but is typically 8 and always <= 8 */
+     #[allow(clippy::useless_conversion)]
+-    Some(result.st_rdev.into())
++    Some(result.st_rdev as u64)
+ }
+ 
+ /** Get the (`st_rdev`) device id for the special file at `path`, cast to a u64. */
+diff --git a/src/read.rs b/src/read.rs
+index 3848bd4..4e7652c 100644
+--- a/src/read.rs
++++ b/src/read.rs
+@@ -432,7 +432,7 @@ fn test_read_buffer() {
+ 
+     let mut rb = ReadBuffer::new();
+     let (pipe_r, pipe_w) =
+-        unistd::pipe2(fcntl::OFlag::O_CLOEXEC | fcntl::OFlag::O_NONBLOCK).unwrap();
++        crate::compat::pipe2(fcntl::OFlag::O_CLOEXEC | fcntl::OFlag::O_NONBLOCK).unwrap();
+ 
+     #[cfg(not(miri))]
+     fn read_all(rb: &mut ReadBuffer, fd: &OwnedFd) {
+diff --git a/src/tracking.rs b/src/tracking.rs
+index b5d42e9..fb4938e 100644
+--- a/src/tracking.rs
++++ b/src/tracking.rs
+@@ -18,7 +18,6 @@ use crate::*;
+ use core::str;
+ use log::{debug, error};
+ use nix::libc;
+-use nix::sys::memfd;
+ use nix::unistd;
+ use std::cell::RefCell;
+ use std::collections::{BTreeMap, BTreeSet, VecDeque};
+@@ -3076,10 +3075,7 @@ pub fn process_way_msg(
+                 let new_table = process_dmabuf_feedback(feedback)?;
+                 if Some(&new_table) != feedback.output_format_table.as_ref() {
+                     // Table has changed; send new fd
+-                    let local_fd = memfd::memfd_create(
+-                        c"/waypipe",
+-                        memfd::MFdFlags::MFD_CLOEXEC | memfd::MFdFlags::MFD_ALLOW_SEALING,
+-                    )
++                    let local_fd = crate::compat::memfd_create(c"/waypipe")
+                     .map_err(|x| tag!("Failed to create memfd: {:?}", x))?;
+                     let sz: u32 = new_table.len().try_into().unwrap();
+                     assert!(sz > 0);

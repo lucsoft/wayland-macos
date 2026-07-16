@@ -1,0 +1,51 @@
+[package]
+name = "wayland-macos"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Pure-Rust Wayland server backend (no system libwayland needed).
+wayland-server = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "server", "staging", "unstable"] }
+# Cocoa / AppKit bindings.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry", "NSData"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSWindow",
+    "NSView",
+    "NSResponder",
+    "NSImage",
+    "NSImageView",
+    "NSColor",
+    "NSRunningApplication",
+    "NSEvent",
+    "NSTrackingArea",
+    "NSScreen",
+    "NSPasteboard",
+] }
+objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
+objc2-core-graphics = { version = "0.3", features = [
+    "CGImage",
+    "CGColorSpace",
+    "CGContext",
+    "CGBitmapContext",
+] }
+objc2-quartz-core = { version = "0.3", features = ["CALayer", "objc2-core-foundation"] }
+dispatch2 = "0.3"
+memmap2 = "0.9"
+libc = "0.2"
+
+# Used only by the test client binary (src/bin/testclient.rs).
+wayland-client = "0.31"
+
+[[bin]]
+name = "wayland-macos"
+path = "src/main.rs"
+
+[[bin]]
+name = "testclient"
+path = "src/bin/testclient.rs"
+
+[profile.dev]
+opt-level = 1
