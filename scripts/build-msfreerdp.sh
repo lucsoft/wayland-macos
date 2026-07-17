@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build Microsoft's FreeRDP fork (FreeRDP 2.x, with the RAIL/VAIL extensions that
 # WSLg's weston-rdprail server speaks) on macOS and install it to
-# ~/.local/msfreerdp. Required for the compositor's `--use-microsoft-rail-protocol`
-# mode (`cargo build --features rail` links against it — see build.rs, MSFREERDP_PREFIX).
+# ~/.local/msfreerdp. Required for the compositor's RAIL back-end
+# (`cargo build --features rail` links against it — see build.rs, MSFREERDP_PREFIX).
 #
 # Upstream FreeRDP 3 (Homebrew) does NOT interoperate with WSLg's RAIL stream, so
 # the matched 2.x fork is required on the client side too.

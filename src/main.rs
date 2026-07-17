@@ -78,12 +78,13 @@ fn main() {
         host::run_window_host(sock);
     }
 
-    // Back-end selection. Default: native Wayland compositor (we are the
-    // compositor; protocol forwarded via waypipe). With
-    // `--use-microsoft-rail-protocol`: the WSLg-style RAIL client back-end
-    // (Weston composites in the container, we draw its RAIL windows). Both sit
-    // behind the same WinCmd/InputBus seam — see `src/rail.rs`.
-    let use_rail = args.iter().any(|a| a == "--use-microsoft-rail-protocol");
+    // Back-end selection is a build-time choice. Default (no `rail` feature):
+    // native Wayland compositor (we are the compositor; protocol forwarded via
+    // waypipe). A build with `--features rail` is a RAIL-only build: the
+    // WSLg-style RAIL client back-end (Weston composites in the container, we
+    // draw its RAIL windows). Both sit behind the same WinCmd/InputBus seam —
+    // see `src/rail.rs`.
+    let use_rail = cfg!(feature = "rail");
     // Record the back-end early: the router (multiplex, below) reads it to tell
     // each host to keep RAIL windows non-resizable.
     mac::RAIL_MODE.store(use_rail, std::sync::atomic::Ordering::Relaxed);
@@ -158,7 +159,7 @@ fn main() {
     // Run the selected back-end off the main thread; it marshals window
     // operations back to AppKit via the main GCD queue.
     if use_rail {
-        info!(target: "wl", "back-end = RAIL (--use-microsoft-rail-protocol)");
+        info!(target: "wl", "back-end = RAIL (--features rail)");
         std::thread::Builder::new()
             .name("rail".into())
             .spawn(move || rail::run(bus))

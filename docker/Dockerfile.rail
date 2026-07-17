@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
-# RAIL back-end container (for the compositor's `--use-microsoft-rail-protocol`
-# mode). This is the WSLg model: Weston runs as an RDP server and remotes each
+# RAIL back-end container (for the compositor's RAIL back-end, a `--features
+# rail` build). This is the WSLg model: Weston runs as an RDP server and remotes each
 # Linux window *individually* (RemoteApp/RAIL) rather than a whole desktop.
 #
 #   Linux app ──Wayland──> Weston (rdprail-shell + rdp backend) ──RDP/RAIL/TCP──> macOS

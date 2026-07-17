@@ -2,8 +2,8 @@
 # Container side of the RAIL pipeline:
 #   Linux app  ->  Weston (rdp-backend, RDP server)  ->  (TCP :3389)  ->  macOS
 #
-# The macOS side runs a FreeRDP RAIL client (the compositor's
-# `--use-microsoft-rail-protocol` mode) which draws each RAIL window as an
+# The macOS side runs a FreeRDP RAIL client (the compositor's RAIL back-end,
+# a `--features rail` build) which draws each RAIL window as an
 # NSWindow. Weston does the compositing here; only pixels + window metadata cross
 # the boundary (contrast with the waypipe image, which forwards the Wayland
 # protocol itself).

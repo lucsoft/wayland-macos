@@ -12,7 +12,7 @@
 //!     waypipe client — connect it to the compositor, listen on a unix socket
 //!     socat bridge — a TCP<->unix bridge so the container can reach waypipe
 //!
-//!   RAIL back-end (`--use-microsoft-rail-protocol`): none of the above — the
+//!   RAIL back-end (a `--features rail` build): none of the above — the
 //!     compositor is an RDP client that dials into the container's Weston RDP
 //!     server, so there's no local Wayland socket / waypipe / socat.
 //!
@@ -79,14 +79,15 @@ fn print_help() {
     println!(
         "wayland-macos — Wayland-on-macOS orchestrator\n\n\
          USAGE:\n\
-         \x20 wayland-macos [up] [--multiplex] [--use-microsoft-rail-protocol]\n\
+         \x20 wayland-macos [up] [--multiplex]\n\
          \x20 wayland-macos stop\n\n\
          COMMANDS:\n\
          \x20 up     (default) start pulseaudio + the compositor (+ waypipe & TCP bridge for the waypipe back-end)\n\
          \x20 stop   tear down everything `up` started\n\n\
          FLAGS (forwarded to the compositor):\n\
-         \x20 --multiplex                        surface each app as its own native macOS app\n\
-         \x20 --use-microsoft-rail-protocol      RAIL back-end (builds core with --features rail; no waypipe/bridge)\n\n\
+         \x20 --multiplex                        surface each app as its own native macOS app\n\n\
+         Back-end is a build-time choice: a plain build is the waypipe back-end; a\n\
+         `--features rail` build is the RAIL back-end (no waypipe/bridge).\n\n\
          Env: WLMAC_MULTIPLEX=1 implies --multiplex; BRIDGE_PORT overrides the TCP\n\
          bridge port (default 7777); WAYPIPE overrides the waypipe client path;\n\
          WAYPIPE_COMPRESS sets wire compression (lz4|zstd|none, default lz4)."
@@ -100,15 +101,17 @@ fn print_help() {
 fn up(flags: &[String]) {
     let multiplex = flags.iter().any(|f| f == "--multiplex")
         || std::env::var("WLMAC_MULTIPLEX").as_deref() == Ok("1");
-    let rail = flags.iter().any(|f| f == "--use-microsoft-rail-protocol");
+    // The back-end is a build-time choice: a `--features rail` build is the
+    // RAIL back-end, a plain build is the waypipe back-end.
+    let rail = cfg!(feature = "rail");
     let root = project_root();
 
     // audio bridge — shared by both back-ends (optional; degrades cleanly).
     start_pulseaudio(root.as_deref());
 
-    // compositor (built with the rail feature when requested).
-    let core = ensure_core(root.as_deref(), rail);
-    start_compositor(&core, multiplex, rail);
+    // compositor (built with the same feature set as this CLI).
+    let core = ensure_core(root.as_deref());
+    start_compositor(&core, multiplex);
 
     if rail {
         // RAIL: the compositor is an RDP *client* dialing into the container's
@@ -173,7 +176,7 @@ fn ensure_waypipe(root: Option<&Path>) -> PathBuf {
 /// CLI actually picks up the new code (just as the old mac-side script did). Only
 /// when run outside the tree (a plain installed binary) do we fall back to a
 /// sibling of this CLI or a PATH lookup.
-fn ensure_core(root: Option<&Path>, rail: bool) -> PathBuf {
+fn ensure_core(root: Option<&Path>) -> PathBuf {
     let (profile, sibling) = exe_profile_and_sibling("wayland-macos-core");
 
     if let Some(root) = root {
@@ -182,7 +185,9 @@ fn ensure_core(root: Option<&Path>, rail: bool) -> PathBuf {
         if profile == "release" {
             args.push("--release");
         }
-        if rail {
+        // Build the compositor with the same back-end feature as this CLI so
+        // `cargo run --features rail` yields a RAIL core.
+        if cfg!(feature = "rail") {
             args.push("--features");
             args.push("rail");
         }
@@ -205,7 +210,7 @@ fn ensure_core(root: Option<&Path>, rail: bool) -> PathBuf {
 }
 
 /// Start the compositor if it isn't already running.
-fn start_compositor(core: &Path, multiplex: bool, rail: bool) {
+fn start_compositor(core: &Path, multiplex: bool) {
     if compositor_running() {
         info!(target: "cli", "compositor already running");
         return;
@@ -214,9 +219,6 @@ fn start_compositor(core: &Path, multiplex: bool, rail: bool) {
     if multiplex {
         info!(target: "cli", "multiplex = on (per-app window hosts)");
         args.push("--multiplex");
-    }
-    if rail {
-        args.push("--use-microsoft-rail-protocol");
     }
     info!(target: "cli", "starting compositor {}", args.join(" "));
     // Fresh log so socket discovery reads THIS run's announcement.

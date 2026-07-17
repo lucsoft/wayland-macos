@@ -1,4 +1,4 @@
-//! RAIL back-end (`--use-microsoft-rail-protocol`).
+//! RAIL back-end (built with `--features rail`).
 //!
 //! Alternative to the native Wayland compositor (`src/wayland/`). Instead of
 //! *being* the compositor and forwarding the Wayland protocol across the
@@ -23,8 +23,8 @@
 //! translates its window/surface callbacks into `WinCmd`, and forwards input.
 //!
 //! Built only with the `rail` Cargo feature (which links FreeRDP). Without it,
-//! the flag prints a hint to rebuild — see the `#[cfg(not(feature = "rail"))]`
-//! stub at the bottom.
+//! the compositor selects the native Wayland back-end and this module is a stub
+//! that never runs — see the `#[cfg(not(feature = "rail"))]` stub at the bottom.
 
 use std::sync::Arc;
 
@@ -460,14 +460,14 @@ mod imp {
 pub use imp::run;
 
 /// Stub used when the crate is built without the `rail` feature (the default):
-/// FreeRDP isn't linked, so the mode can't run. Point the user at the rebuild.
+/// FreeRDP isn't linked, so the mode can't run. The back-end is chosen at build
+/// time (`main.rs` gates on `cfg!(feature = "rail")`), so this is never reached
+/// in a default build — it exists only to satisfy the compiler.
 #[cfg(not(feature = "rail"))]
 pub fn run(_bus: Arc<InputBus>) {
     log::error!(
         target: "rail",
-        "--use-microsoft-rail-protocol requires a build with the `rail` \
-         feature (FreeRDP)."
+        "the RAIL back-end requires a build with the `rail` feature (FreeRDP)."
     );
     log::error!(target: "rail", "Rebuild with:  cargo build --features rail   (needs `brew install freerdp`)");
-    log::error!(target: "rail", "Falling back to no windows; run without the flag for the native compositor.");
 }

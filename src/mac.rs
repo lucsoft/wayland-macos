@@ -1597,7 +1597,7 @@ fn subsurface_origin(win_h: f64, x: i32, y: i32, lh: f64) -> (f64, f64) {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// True when running the RAIL back-end (`--use-microsoft-rail-protocol`). Set
+/// True when running the RAIL back-end (a `--features rail` build). Set
 /// once at startup; read in `create_window` to keep RAIL windows non-resizable
 /// (see the style block there).
 pub static RAIL_MODE: std::sync::atomic::AtomicBool =
