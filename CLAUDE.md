@@ -47,11 +47,10 @@ process per app. `--multiplex` does exactly that:
   argv[0]), so `router::spawn_helper` execs the child through a symlink whose
   basename is the app name — derived from `xdg_toplevel.set_app_id` (fallback:
   title) by `app_display_name`. Verified via LaunchServices' `LSDisplayName`.
-- Each host also gets a **Dock icon**: the client's `xdg_toplevel_icon_v1` buffer
-  artwork when provided (→ `WinCmd::SetIcon` → `NSApplication.setApplicationIcon
-  Image:`), otherwise a generated identicon the host derives from its name at
-  startup (`host::identicon_bgra`). Themed-name icons can't be resolved on macOS,
-  so those keep the identicon.
+- A host's **Dock icon** is set only when the client provides buffer artwork via
+  `xdg_toplevel_icon_v1` (→ `WinCmd::SetIcon` → `NSApplication.setApplicationIcon
+  Image:`). Otherwise no icon is set (the default icon stands). Themed-name icons
+  can't be resolved to artwork on macOS, so those get no icon either.
 - The seam is unchanged: `mac::post(WinCmd)` normally hits the local GCD main
   queue; with the router enabled it serializes the `WinCmd` and sends it to the
   owning host (`src/router.rs` → `src/ipc.rs`), whose `handle()` runs the *same*
@@ -113,7 +112,7 @@ records, and all protocol/`wayland_server` imports.
 | `primary_selection.rs` | `zwp_primary_selection_v1` (X11-style middle-click paste, client-to-client only) |
 | `layer_shell.rs` | `zwlr_layer_shell_v1` (docked bars/panels + launchers → borderless floating NSWindow anchored to a screen edge; a keyboard-interactive surface like fuzzel is made key; see `create_layer_window`) |
 | `color_management.rs` | `wp_color_manager_v1` (HDR: PQ/HLG/sRGB transfer + BT.2020/Display-P3/sRGB primaries → a `ColorDesc` staged on the surface; see HDR below) |
-| `xdg_toplevel_icon.rs` | `xdg_toplevel_icon_v1` (per-toplevel icons; a buffer icon → `WinCmd::SetIcon` → the app's Dock icon in --multiplex mode; name-only icons fall back to the host's generated identicon) |
+| `xdg_toplevel_icon.rs` | `xdg_toplevel_icon_v1` (per-toplevel icons; a buffer icon → `WinCmd::SetIcon` → the app's Dock icon in --multiplex mode; name-only icons are ignored — no icon set) |
 
 ## Adding a new Wayland protocol
 

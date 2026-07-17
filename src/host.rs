@@ -23,94 +23,6 @@ use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use crate::input::InputBus;
 use crate::ipc::{read_frame, write_frame, Downlink, Uplink};
 
-/// Generate a GitHub-style identicon as BGRA pixels (premultiplied, byte order
-/// B,G,R,A — same as `make_cgimage` expects), deterministic from `seed`. A 5x5
-/// left-right-mirrored grid of a hash-picked accent color on a light tile. Used
-/// as the default Dock icon when the client provides no real artwork.
-fn identicon_bgra(seed: &str) -> (i32, i32, i32, Vec<u8>) {
-    const N: usize = 512;
-    // FNV-1a over the seed → deterministic hash, no deps.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in seed.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    // Pleasant accent palette (r,g,b); index by hash.
-    const PALETTE: [(u8, u8, u8); 12] = [
-        (0x2f, 0x81, 0xf7), (0xe3, 0x4c, 0x26), (0x2d, 0xa4, 0x4e), (0x8a, 0x63, 0xd2),
-        (0xf0, 0x9d, 0x1a), (0x1a, 0xbc, 0x9c), (0xd6, 0x33, 0x84), (0x00, 0x96, 0x88),
-        (0x79, 0x55, 0x48), (0x5c, 0x6b, 0xc0), (0xc0, 0x39, 0x2b), (0x60, 0x7d, 0x8b),
-    ];
-    let (fr, fg, fb) = PALETTE[(h % PALETTE.len() as u64) as usize];
-    let (br, bg, bb) = (0xf0u8, 0xf0u8, 0xf0u8); // light neutral tile
-
-    let mut px = vec![0u8; N * N * 4];
-    for i in 0..N * N {
-        let o = i * 4;
-        px[o] = bb;
-        px[o + 1] = bg;
-        px[o + 2] = br;
-        px[o + 3] = 255;
-    }
-    let margin = N / 8;
-    let usable = N - 2 * margin;
-    let cell = usable / 5;
-    for row in 0..5usize {
-        for col in 0..3usize {
-            if (h >> (row * 3 + col)) & 1 == 1 {
-                let x0 = margin + col * cell;
-                let y0 = margin + row * cell;
-                for y in y0..y0 + cell {
-                    for x in x0..x0 + cell {
-                        // Write the pixel and its horizontal mirror, so the icon is
-                        // exactly left-right symmetric regardless of cell rounding.
-                        for px_x in [x, N - 1 - x] {
-                            let o = (y * N + px_x) * 4;
-                            px[o] = fb;
-                            px[o + 1] = fg;
-                            px[o + 2] = fr;
-                            px[o + 3] = 255;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    (N as i32, N as i32, (N * 4) as i32, px)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::identicon_bgra;
-
-    #[test]
-    fn identicon_is_shaped_deterministic_and_mirrored() {
-        let (w, h, stride, px) = identicon_bgra("org.gnome.Console");
-        assert_eq!((w, h, stride), (512, 512, 512 * 4));
-        assert_eq!(px.len(), (w * h * 4) as usize);
-
-        // Deterministic per seed; different seeds generally differ.
-        assert_eq!(identicon_bgra("org.gnome.Console").3, px);
-        assert_ne!(identicon_bgra("org.kde.konsole").3, px);
-
-        // Not a blank tile: some foreground (non-background) pixel exists.
-        assert!(
-            px.chunks_exact(4).any(|p| p[0] != 0xf0 || p[1] != 0xf0 || p[2] != 0xf0),
-            "identicon has no foreground cells"
-        );
-
-        // Left-right mirrored (the identicon grid mirrors columns).
-        let n = w as usize;
-        for y in (0..n).step_by(37) {
-            for x in (0..n).step_by(37) {
-                let o = (y * n + x) * 4;
-                let m = (y * n + (n - 1 - x)) * 4;
-                assert_eq!(px[o..o + 4], px[m..m + 4], "asymmetry at ({x},{y})");
-            }
-        }
-    }
-}
-
 /// Entry point for a window-host child. `sock_path` is the Unix socket the
 /// compositor is listening on for this app. Never returns (runs the AppKit loop).
 pub fn run_window_host(sock_path: &str) -> ! {
@@ -150,12 +62,6 @@ pub fn run_window_host(sock_path: &str) -> ! {
     } else {
         NSApplicationActivationPolicy::Accessory
     });
-
-    // Default Dock icon: a generated identicon from the app name, shown until (and
-    // unless) the client provides real artwork via xdg_toplevel_icon (which
-    // arrives later as a WinCmd::SetIcon and overrides this).
-    let (iw, ih, istride, ipx) = identicon_bgra(&name);
-    crate::mac::set_app_icon(mtm, iw, ih, istride, &ipx);
 
     // Input sink: an InputBus whose waker pipe wakes a forwarder thread, which
     // drains it and writes each event up the socket. This reuses InputBus
