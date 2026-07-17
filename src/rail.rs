@@ -36,6 +36,7 @@ mod imp {
     use std::ffi::{c_char, c_int, c_void, CStr, CString};
     use std::os::fd::OwnedFd;
     use std::ptr;
+    use std::sync::Mutex;
 
     use crate::input::InputEvent;
     use crate::mac::{self, WinCmd};
@@ -79,6 +80,12 @@ mod imp {
         fn rail_stop();
     }
 
+    /// Window ids the RAIL back-end has opened and not yet deleted. On session
+    /// disconnect the server stops sending per-window `window_delete`s, so we
+    /// destroy whatever is still live here (otherwise the NSWindows linger with
+    /// a frozen last frame). Touched from the FreeRDP event-loop thread only.
+    static LIVE_WINDOWS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
     fn cstr(p: *const c_char) -> String {
         if p.is_null() {
             return String::new();
@@ -110,6 +117,7 @@ mod imp {
             return;
         }
         eprintln!("[rail] window create id={id} {w}x{h} title={:?}", cstr(title));
+        LIVE_WINDOWS.lock().unwrap().push(id);
         mac::post(WinCmd::Create {
             id,
             width: w as i32,
@@ -149,6 +157,7 @@ mod imp {
 
     extern "C" fn on_window_delete(_user: *mut c_void, id: u32) {
         eprintln!("[rail] window delete id={id}");
+        LIVE_WINDOWS.lock().unwrap().retain(|&w| w != id);
         mac::post(WinCmd::Destroy { id });
     }
 
@@ -187,6 +196,12 @@ mod imp {
 
     extern "C" fn on_disconnected(_user: *mut c_void) {
         eprintln!("[rail] RDP session disconnected");
+        // The session is gone; close every window it opened. Draining the list
+        // also stops a late `window_delete` from double-destroying.
+        let live: Vec<u32> = std::mem::take(&mut *LIVE_WINDOWS.lock().unwrap());
+        for id in live {
+            mac::post(WinCmd::Destroy { id });
+        }
     }
 
     /// A pipe whose read end blocks (the drain loop sleeps on it) and whose write
