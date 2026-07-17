@@ -8,18 +8,30 @@ FROM rust:alpine AS waypipe-build
 # Keep in sync with scripts/build-waypipe.sh.
 ARG WAYPIPE_REPO=https://gitlab.freedesktop.org/mstoeckl/waypipe.git
 ARG WAYPIPE_COMMIT=1ac039b4d50e2658d284e750c182266cc00efe74
-RUN apk add --no-cache git build-base
+# build-base + the lz4/zstd wrapper build-deps: pkgconf finds the libs, lz4-dev/
+# zstd-dev provide the headers, lz4-static/zstd-static the .a archives (the musl
+# waypipe binary links statically, so it needs the static libs — the runtime stage
+# then carries no lz4/zstd .so dependency), and clang-dev supplies libclang for the
+# `bindgen` CLI (installed below) that generates the FFI bindings.
+# target-feature=-crt-static: build `bindgen` dynamically linked — a static musl
+# binary cannot dlopen libclang.so ("Dynamic loading not supported"), which bindgen
+# does at runtime to parse the C headers.
+RUN apk add --no-cache git build-base pkgconf lz4-dev zstd-dev lz4-static zstd-static clang-dev \
+    && RUSTFLAGS="-C target-feature=-crt-static" cargo install bindgen-cli --locked
 WORKDIR /build
 RUN git clone "$WAYPIPE_REPO" . && git checkout --quiet "$WAYPIPE_COMMIT"
 # The patch is macOS-cfg-gated, so it's a no-op for the Linux build's behavior;
 # applying it anyway keeps "both ends build the same source" literally true.
 COPY waypipe-macos.patch /tmp/waypipe-macos.patch
 RUN git apply /tmp/waypipe-macos.patch
-# Match the macOS build's feature set (no lz4/zstd/dmabuf); the wire uses
-# uncompressed frames (-c none). BuildKit cache mounts persist the registry/target.
+# Match the macOS build's feature set: lz4 + zstd wire compression, no
+# dmabuf/video/gbmfallback (shm-only/software — no GPU). Both ends enable the same
+# codecs so the compression chosen by `-c` (mac-side.sh / entrypoint.sh) agrees;
+# waypipe rejects a connection whose peer advertises a different compression type.
+# BuildKit cache mounts persist the registry/target.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --no-default-features --release \
+    cargo build --no-default-features --features lz4,zstd --release \
     && cp target/release/waypipe /usr/local/bin/waypipe
 
 FROM alpine:edge

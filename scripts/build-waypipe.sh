@@ -31,10 +31,17 @@ git -C "$BUILD_DIR" clean -fdq
 echo "[waypipe] applying $(basename "$PATCH")"
 git -C "$BUILD_DIR" apply "$PATCH"
 
-# Match the container build's feature set (no lz4/zstd/dmabuf); the wire uses
-# uncompressed frames (-c none), so both ends agree.
-echo "[waypipe] building (cargo --no-default-features --release)"
-( cd "$BUILD_DIR" && cargo build --no-default-features --release )
+# Match the container build's feature set: lz4 + zstd wire compression, but no
+# dmabuf/video/gbmfallback (we're shm-only/software — no GPU import). Both ends
+# enable the same codecs so the compression negotiated by `-c` (see src/cli.rs /
+# docker/entrypoint.sh) agrees — waypipe rejects a connection whose peer advertises a
+# different compression type. The lz4/zstd wrappers link Homebrew's liblz4/libzstd
+# (found via pkg-config) and generate bindings with the `bindgen` CLI, so both
+# must be present:
+#   brew install lz4 zstd pkg-config
+#   cargo install bindgen-cli   # provides the `bindgen` binary on PATH
+echo "[waypipe] building (cargo --no-default-features --features lz4,zstd --release)"
+( cd "$BUILD_DIR" && cargo build --no-default-features --features lz4,zstd --release )
 
 mkdir -p "$ROOT/bin"
 cp "$BUILD_DIR/target/release/waypipe" "$OUT"

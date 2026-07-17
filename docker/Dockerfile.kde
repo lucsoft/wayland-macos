@@ -7,14 +7,19 @@
 FROM rust:alpine AS waypipe-build
 ARG WAYPIPE_REPO=https://gitlab.freedesktop.org/mstoeckl/waypipe.git
 ARG WAYPIPE_COMMIT=1ac039b4d50e2658d284e750c182266cc00efe74
-RUN apk add --no-cache git build-base
+# lz4-static/zstd-static: the musl waypipe links statically. target-feature=
+# -crt-static: build `bindgen` dynamically linked so it can dlopen libclang.so at
+# runtime (a static musl binary cannot). See docker/Dockerfile.
+RUN apk add --no-cache git build-base pkgconf lz4-dev zstd-dev lz4-static zstd-static clang-dev \
+    && RUSTFLAGS="-C target-feature=-crt-static" cargo install bindgen-cli --locked
 WORKDIR /build
 RUN git clone "$WAYPIPE_REPO" . && git checkout --quiet "$WAYPIPE_COMMIT"
 COPY waypipe-macos.patch /tmp/waypipe-macos.patch
 RUN git apply /tmp/waypipe-macos.patch
+# lz4 + zstd wire compression, no dmabuf/video/gbmfallback (see docker/Dockerfile).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --no-default-features --release \
+    cargo build --no-default-features --features lz4,zstd --release \
     && cp target/release/waypipe /usr/local/bin/waypipe
 
 FROM alpine:edge

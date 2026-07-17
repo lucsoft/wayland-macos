@@ -85,8 +85,13 @@ done
 # child/D-Bus-activated program get no display ("Cannot open display"). A named
 # socket lets EVERY client — the app, its shell, launched programs, and activated
 # helpers — connect via WAYLAND_DISPLAY. (No --oneshot: several clients connect.)
-echo "[container] starting waypipe display server (wayland-0)"
-waypipe -c none --no-gpu --display wayland-0 -s "$SOCK" server &
+# -c lz4: compress the wire (waypipe's default low-latency codec). Must match the
+# macOS client's `-c` (src/cli.rs) — waypipe rejects the connection on a
+# compression-type mismatch. Override with WAYPIPE_COMPRESS (e.g. zstd, none), but
+# keep both ends in sync. Both binaries are built with lz4+zstd support.
+WAYPIPE_COMPRESS="${WAYPIPE_COMPRESS:-lz4}"
+echo "[container] starting waypipe display server (wayland-0), compression: $WAYPIPE_COMPRESS"
+waypipe -c "$WAYPIPE_COMPRESS" --no-gpu --display wayland-0 -s "$SOCK" server &
 pids+=($!)
 for _ in $(seq 1 100); do
     [ -S "$XDG_RUNTIME_DIR/wayland-0" ] && break

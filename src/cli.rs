@@ -88,7 +88,8 @@ fn print_help() {
          \x20 --multiplex                        surface each app as its own native macOS app\n\
          \x20 --use-microsoft-rail-protocol      RAIL back-end (builds core with --features rail; no waypipe/bridge)\n\n\
          Env: WLMAC_MULTIPLEX=1 implies --multiplex; BRIDGE_PORT overrides the TCP\n\
-         bridge port (default 7777); WAYPIPE overrides the waypipe client path."
+         bridge port (default 7777); WAYPIPE overrides the waypipe client path;\n\
+         WAYPIPE_COMPRESS sets wire compression (lz4|zstd|none, default lz4)."
     );
 }
 
@@ -262,10 +263,17 @@ fn start_waypipe_client(waypipe: &Path, runtime: &str, display: &str) {
         .args(["-f", "waypipe-macos.*client"])
         .status();
     let _ = fs::remove_file(CLIENT_SOCK);
-    info!(target: "cli", "starting waypipe client on {CLIENT_SOCK}");
+    // -c lz4: compress the wire (waypipe's default low-latency codec). Must match
+    // the container server's `-c` (docker/entrypoint.sh) — waypipe rejects the
+    // connection on a compression-type mismatch, and a binary built without the
+    // codec silently downgrades to none. WAYPIPE_COMPRESS overrides it (e.g. zstd
+    // for a better ratio, none to disable); keep both ends in sync. Both binaries
+    // are built with lz4+zstd support (scripts/build-waypipe.sh).
+    let compress = std::env::var("WAYPIPE_COMPRESS").unwrap_or_else(|_| "lz4".to_string());
+    info!(target: "cli", "starting waypipe client on {CLIENT_SOCK} (compression: {compress})");
     let child = spawn_detached(
         &waypipe.to_string_lossy(),
-        &["-c", "none", "--no-gpu", "-s", CLIENT_SOCK, "client"],
+        &["-c", &compress, "--no-gpu", "-s", CLIENT_SOCK, "client"],
         WAYPIPE_LOG,
         &[
             ("XDG_RUNTIME_DIR", runtime),

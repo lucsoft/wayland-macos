@@ -18,20 +18,28 @@ FROM rust:bookworm AS waypipe-build
 # Keep in sync with scripts/build-waypipe.sh, docker/Dockerfile, docker/Dockerfile.kde.
 ARG WAYPIPE_REPO=https://gitlab.freedesktop.org/mstoeckl/waypipe.git
 ARG WAYPIPE_COMMIT=1ac039b4d50e2658d284e750c182266cc00efe74
+# build-essential + the lz4/zstd wrapper build-deps: pkg-config finds the libs,
+# liblz4-dev/libzstd-dev provide headers + link targets, and libclang supplies the
+# libclang that the `bindgen` CLI (installed below) needs for FFI-binding generation.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git build-essential pkg-config ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+      liblz4-dev libzstd-dev libclang-dev \
+ && rm -rf /var/lib/apt/lists/* \
+ && cargo install bindgen-cli --locked
 WORKDIR /build
 RUN git clone "$WAYPIPE_REPO" . && git checkout --quiet "$WAYPIPE_COMMIT"
 # macOS-cfg-gated patch: a no-op for the Linux build, applied so "both ends build
 # the same source" stays literally true.
 COPY waypipe-macos.patch /tmp/waypipe-macos.patch
 RUN git apply /tmp/waypipe-macos.patch
-# Match the macOS build's feature set (no lz4/zstd/dmabuf); the wire uses
-# uncompressed frames (-c none). BuildKit cache mounts persist the registry/target.
+# Match the macOS build's feature set: lz4 + zstd wire compression, no
+# dmabuf/video/gbmfallback (shm-only/software — no GPU). Both ends enable the same
+# codecs so the compression chosen by `-c` agrees; waypipe rejects a connection
+# whose peer advertises a different compression type. BuildKit cache mounts persist
+# the registry/target.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --no-default-features --release \
+    cargo build --no-default-features --features lz4,zstd --release \
     && cp target/release/waypipe /usr/local/bin/waypipe
 
 FROM debian:sid
@@ -41,6 +49,7 @@ FROM debian:sid
 # (software) compositor (KWIN_COMPOSE=Q), which is what we need with no GPU.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash socat \
+      liblz4-1 libzstd1 \
       dbus dbus-x11 \
       pulseaudio-utils gstreamer1.0-pulseaudio \
       kwin-wayland \
