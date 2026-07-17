@@ -71,6 +71,7 @@ records, and all protocol/`wayland_server` imports.
 | `keyboard_shortcuts_inhibit.rs` | `zwp_keyboard_shortcuts_inhibit_v1` (grants the inhibitor; see file note on scope) |
 | `primary_selection.rs` | `zwp_primary_selection_v1` (X11-style middle-click paste, client-to-client only) |
 | `layer_shell.rs` | `zwlr_layer_shell_v1` (docked bars/panels + launchers → borderless floating NSWindow anchored to a screen edge; a keyboard-interactive surface like fuzzel is made key; see `create_layer_window`) |
+| `color_management.rs` | `wp_color_manager_v1` (HDR: PQ/HLG/sRGB transfer + BT.2020/Display-P3/sRGB primaries → a `ColorDesc` staged on the surface; see HDR below) |
 
 ## Adding a new Wayland protocol
 
@@ -179,6 +180,24 @@ prints a hint and apps start muted; nothing else breaks. This is not a `bridge/`
   compositor advertises them via `wl_output`, and `present_frame`/`create_window`
   in `mac.rs` convert physical buffer pixels ↔ logical points. Clients must render
   at the advertised scale (KWin needs `--scale 2` passed explicitly).
+- HDR: a client declares its content's color via `wp_color_manager_v1`
+  (`color_management.rs`) — a parametric image description (PQ/HLG/sRGB transfer +
+  BT.2020/Display-P3/sRGB primaries) is resolved to a `ColorDesc` (in `mac.rs`,
+  double-buffered onto the surface and applied on commit), then carried through
+  `WinCmd::Frame`/`SubFrame` alongside the pixel `PixelFormat`. `shm.rs` advertises
+  and `buffer_to_pixels` decodes the high-bit-depth formats without truncating:
+  10-bit `xrgb2101010`/`argb2101010` and float16 `abgr16161616f` (the common RGB
+  HDR shm layouts; other byte orders are not advertised). `make_cgimage` tags the
+  frame with the matching `CGColorSpace` (`kCGColorSpaceITUR_2100_PQ`,
+  extended-linear P3/2020, Display P3, …) and `present_frame` opts the layer into
+  Extended Dynamic Range (`setWantsExtendedDynamicRangeContent`) for PQ/HLG
+  content — so highlights use the display's EDR headroom. Two constraints: Core
+  Graphics can't ingest a 10-bit RGB `CGImage`, so 10-bit is expanded to 16-bit
+  RGBA first (`expand_2101010_to_rgba16`); and being **shm-only/software** (no
+  dmabuf/GPU import), HDR only arrives from clients that render high-bit-depth into
+  shm — no tone-mapping is done, the OS composites via the tagged color space.
+  Exercise it end-to-end with `WLMAC_HDR=1 cargo run --bin testclient` (a 10-bit PQ
+  ramp); the log shows `[mac] EDR enabled; display headroom …` on an EDR display.
 - Popups/menus (`xdg_popup`): the client positions them client-side from the
   screen geometry, so a Qt client with **no valid `QScreen`** anchors every menu
   at `(0,0)`. Two things guarantee a valid screen: `zxdg_output_v1` at v3 applies
