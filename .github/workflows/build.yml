@@ -27,15 +27,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The compositor links libxkbcommon dynamically (see build.rs); Homebrew
-      # supplies it. xkeyboard-config comes in as a dependency (runtime keymaps).
+      # libxkbcommon: the compositor links it dynamically (see build.rs);
+      # xkeyboard-config comes in as a dependency (runtime keymaps).
+      # lz4 + zstd + pkg-config: the waypipe client's lz4/zstd wrappers link these
+      # (found via pkg-config) — see scripts/build-waypipe.sh.
       - name: Install Homebrew deps
-        run: brew install libxkbcommon
+        run: brew install libxkbcommon lz4 zstd pkg-config
 
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
+
+      # The waypipe lz4/zstd wrappers generate FFI bindings with the `bindgen` CLI
+      # (invoked as a binary from their build.rs), so it must be on PATH.
+      - name: Install bindgen-cli
+        run: cargo install bindgen-cli --locked
 
       # Caches ~/.cargo and ./target keyed on the toolchain + Cargo.lock.
       - name: Cache cargo + target
