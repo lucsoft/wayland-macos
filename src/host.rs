@@ -3,7 +3,7 @@
 //!
 //! A host owns a real `NSApplication`, so it gets its own Dock tile and Cmd-Tab
 //! entry (activation policy `Regular`) — that is the whole point of multiplex
-//! mode: "wayland-macos" itself stays hidden (`Accessory`) and each app shows up
+//! mode: the compositor itself stays hidden (`Accessory`) and each app shows up
 //! as its own macOS app. The host runs the *same* AppKit code as the in-process
 //! path — it just receives `WinCmd`s over a socket instead of a channel, and
 //! sends `InputEvent`s back the same way.

@@ -1,6 +1,6 @@
 # The container running the native Linux Wayland app + waypipe.
 # The macOS side (compositor + waypipe client + TCP bridge) is started by
-# scripts/mac-side.sh — see README.
+# `cargo run` (the wayland-macos CLI) — see README.
 services:
   wayland-app:
     build:

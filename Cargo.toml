@@ -2,6 +2,10 @@
 name = "wayland-macos"
 version = "0.1.0"
 edition = "2021"
+# `cargo run` (no --bin) launches the orchestrator CLI, not the compositor. The
+# CLI is the end-user entry point (brings up pulseaudio + waypipe + the socat
+# bridge + the compositor); the compositor is the `wayland-macos-core` bin.
+default-run = "wayland-macos"
 
 [dependencies]
 # Compiles xkb keymaps at runtime from a layout name (links system libxkbcommon
@@ -70,8 +74,17 @@ rail = []
 # Compiles the FreeRDP C bridge (csrc/rail_bridge.c) when the `rail` feature is on.
 cc = "1"
 
+# The orchestrator CLI (default `cargo run` target). Standalone crate root — it
+# only spawns/monitors external processes, so it shares no modules with the
+# compositor.
 [[bin]]
 name = "wayland-macos"
+path = "src/cli.rs"
+
+# The compositor itself. Re-execs *itself* (via current_exe) for the per-app
+# window-host children in --multiplex mode, so the binary name is internal only.
+[[bin]]
+name = "wayland-macos-core"
 path = "src/main.rs"
 
 [[bin]]

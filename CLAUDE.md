@@ -58,8 +58,8 @@ process per app. `--multiplex` does exactly that:
   socket into the compositor's `InputBus`. Window ids are global, so they key
   hosts unambiguously.
 
-Enable it with `WLMAC_MULTIPLEX=1 bash scripts/mac-side.sh` (or pass `--multiplex`
-to the binary directly). First-cut limitations, all documented in `router.rs`:
+Enable it with `WLMAC_MULTIPLEX=1 cargo run` or `cargo run -- --multiplex` (the
+CLI forwards the flag to the compositor). First-cut limitations, all documented in `router.rs`:
 cursor commands are broadcast to every host rather than routed to the focused
 one; frame pixels cross the socket as a plain copy (IOSurface zero-copy is a
 later optimization — the wire type already carries the `Vec<u8>`); and a host
@@ -67,9 +67,16 @@ that stalls its socket read applies back-pressure to the Wayland thread.
 
 ## Source map
 
+There are two binaries: **`wayland-macos`** (`src/cli.rs`, the *default* `cargo
+run` target) is the end-user orchestrator; **`wayland-macos-core`** (`src/main.rs`)
+is the compositor proper. The CLI builds + launches the core alongside the audio
+bridge (both back-ends) and, for the waypipe back-end, the waypipe client + socat
+bridge.
+
 | Path | Responsibility |
 |------|----------------|
-| `src/main.rs` | Entry point: detects display scale + output size, starts AppKit, spawns the wayland thread. |
+| `src/cli.rs` | **`wayland-macos`** binary (default `cargo run`): orchestrator that starts the pulseaudio bridge + the compositor, plus (waypipe back-end only) the waypipe client + socat bridge; tears them down with `cargo run -- stop`. Replaces the old `mac-side.sh`/`stop.sh`. Shares no modules with the compositor. |
+| `src/main.rs` | **`wayland-macos-core`** binary: compositor entry point — detects display scale + output size, starts AppKit, spawns the wayland thread. |
 | `src/wayland/mod.rs` | Compositor **engine**: `State` + its data model, buffer `present`, `handle_commit`, `process_input`, client-disconnect reaping, globals registration, and `run()` (poll loop). |
 | `src/wayland/*.rs` | One file per protocol family — the `Dispatch`/`GlobalDispatch` impls (see below). |
 | `src/mac.rs` | AppKit side: `WaylandView`/`WaylandWindow`/`WinDelegate`, `WinCmd` handling, drag/resize, cursors, keyboard-layout detection. |
@@ -81,7 +88,7 @@ that stalls its socket read applies back-pressure to the Wayland thread.
 | `src/bin/testclient.rs` | Standalone `wayland-client` test client. |
 | `build.rs` | Points the linker at Homebrew's libxkbcommon. |
 | `docker/` | Container images + `entrypoint.sh` (see Containers). |
-| `scripts/` | `mac-side.sh` (start compositor+waypipe+bridge), `run.sh`, `stop.sh`, `build-waypipe.sh`. |
+| `scripts/` | `run.sh` (bring up the Mac side + launch a container app), `pulseaudio-mac.sh`/`.pa` (audio bridge), `build-waypipe.sh`, `build-msfreerdp.sh` (rail), `e2e-resize-kwin.sh`. Bring-up/teardown itself is `cargo run` / `cargo run -- stop`. |
 
 ### `src/wayland/` module tree
 
@@ -135,8 +142,11 @@ Buffers that aren't plain shm (e.g. single-pixel) extend the `BufferKind` enum i
 ## Build & run
 
 ```bash
-# macOS side: builds + starts the compositor, waypipe client, and TCP bridge.
-bash scripts/mac-side.sh
+# macOS side: builds + starts pulseaudio, the compositor, waypipe client, and TCP bridge.
+cargo run                      # the wayland-macos orchestrator CLI
+cargo run -- stop              # tear it down
+# Compositor alone (no waypipe/bridge, e.g. for the test client):
+cargo run --bin wayland-macos-core
 
 # Container side (GNOME app, default):
 docker compose up wayland-app            # APP env picks the program (default: kgx)
@@ -170,8 +180,9 @@ container afterwards.
 
 waypipe forwards only Wayland — **not** audio — so audio takes a separate,
 out-of-band channel that never touches the compositor: a PulseAudio daemon on the
-Mac (`scripts/pulseaudio-mac.pa`, started by `mac-side.sh`) exposes CoreAudio as
-Pulse sinks/sources and listens on TCP 4713; the container's `entrypoint.sh` sets
+Mac (`scripts/pulseaudio-mac.pa`, started by `scripts/pulseaudio-mac.sh` which the
+`wayland-macos` CLI invokes) exposes CoreAudio as Pulse sinks/sources and listens
+on TCP 4713; the container's `entrypoint.sh` sets
 `PULSE_SERVER=tcp:${MAC_HOST}:4713` so libpulse clients stream straight to it. The
 Dockerfiles ship the PulseAudio client libs (`pulseaudio-utils`; the Debian and
 RAIL images add `gstreamer1.0-pulseaudio` for Qt/GTK media). It's optional and
@@ -184,9 +195,11 @@ The **RAIL back-end reuses this same channel** — RDP/RAIL carries no audio to 
 usable macOS sink (the Mac-side FreeRDP is built `-DWITH_PULSE=OFF
 -DWITH_ALSA=OFF`), so `docker/entrypoint-rail.sh` exports the same `PULSE_SERVER`
 and the RAIL container streams container→Mac even though it's the RDP *server*.
-The daemon-start logic lives in `scripts/pulseaudio-mac.sh` (called by
-`mac-side.sh`; run it directly for a RAIL-only session, which doesn't use
-`mac-side.sh`).
+The daemon-start logic lives in `scripts/pulseaudio-mac.sh` — the CLI calls it for
+both back-ends (`cargo run` and `cargo run -- --use-microsoft-rail-protocol`), and
+you can run it directly. It probes TCP 4713 to decide whether to start (not
+`pulseaudio --check`, which is true for any daemon even one without the CoreAudio
+module / TCP listener).
 
 ## Containers
 
@@ -282,7 +295,7 @@ The daemon-start logic lives in `scripts/pulseaudio-mac.sh` (called by
   NOT Wayland popups — e.g. Firefox's hamburger "AppMenu" is drawn in-content in the
   toplevel's own buffer, so it has no `xdg_popup`/grab and closes via a click the
   client receives, or on focus-out (`windowDidResignKey` → `Focus{false}`).
-- Transport: the `socat` TCP bridges (`scripts/mac-side.sh`, `docker/entrypoint.sh`)
+- Transport: the `socat` TCP bridges (the `wayland-macos` CLI, `docker/entrypoint.sh`)
   set `nodelay` (TCP_NODELAY). The Wayland wire is chatty request/reply; without it
   Nagle stalls small replies by hundreds of ms.
 - Interactive resize: the drag asks the *client* to repaint at the new size

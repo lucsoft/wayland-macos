@@ -22,7 +22,7 @@ chmod 700 "$XDG_RUNTIME_DIR"
 export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}"
 
 # Audio: route libpulse clients to the PulseAudio daemon on the Mac (which
-# bridges to CoreAudio — see scripts/mac-side.sh). waypipe forwards only Wayland,
+# bridges to CoreAudio — started by the wayland-macos CLI). waypipe forwards only Wayland,
 # so audio takes its own TCP channel straight to the host; 4713 is PulseAudio's
 # default port. If the Mac has no PulseAudio running, apps just start muted.
 # Exported here so dbus-update-activation-environment (below) hands it to every

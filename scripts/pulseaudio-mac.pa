@@ -8,7 +8,8 @@
 # docker/entrypoint.sh) and their audio comes out of the Mac's speakers.
 #
 # Started (with `-n`, i.e. WITHOUT the default system config) by
-# scripts/mac-side.sh; stopped by scripts/stop.sh.
+# scripts/pulseaudio-mac.sh, which the `wayland-macos` CLI (`cargo run`) invokes;
+# stopped by `cargo run -- stop`.
 
 .fail
 

@@ -208,7 +208,7 @@ fn target(cmd: &WinCmd) -> Target {
 /// macOS derives a non-bundled app's Dock/Cmd-Tab name from its executable file
 /// name (not argv[0]), so we exec the child through a symlink whose basename is
 /// the app's name — that is what makes each app show up as e.g. "Firefox" rather
-/// than "wayland-macos". (Verified against LaunchServices' `LSDisplayName`.)
+/// than "wayland-macos-core". (Verified against LaunchServices' `LSDisplayName`.)
 fn spawn_helper(app_key: u32, name: &str, regular: bool, r: &Router) -> Option<Helper> {
     let exe = std::env::current_exe().ok()?;
     let pid = std::process::id();
@@ -226,7 +226,7 @@ fn spawn_helper(app_key: u32, name: &str, regular: bool, r: &Router) -> Option<H
     let _ = std::fs::remove_file(&launcher);
     let exec_path = match std::os::unix::fs::symlink(&exe, &launcher) {
         Ok(()) => launcher.clone(),
-        Err(_) => exe.clone(), // fall back to the real binary (name = "wayland-macos")
+        Err(_) => exe.clone(), // fall back to the real binary (name = "wayland-macos-core")
     };
 
     let child = Command::new(&exec_path)

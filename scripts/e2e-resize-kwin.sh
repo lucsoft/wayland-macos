@@ -32,7 +32,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PROC="${WLMAC_PROCESS:-wayland-macos}"
+# The compositor process/app is `wayland-macos-core` (the `wayland-macos` CLI
+# just orchestrates and exits).
+PROC="${WLMAC_PROCESS:-wayland-macos-core}"
 BLACK_THRESH="${BLACK_THRESH:-16}"
 BLACK_MAX_FRAC="${BLACK_MAX_FRAC:-0.02}"
 OUT_DIR="$(mktemp -d)"
@@ -48,7 +50,7 @@ cleanup() {
     if [ "$STARTED_COMPOSITOR" = "1" ]; then
       log "stopping the compositor we started…"
       pkill -x "$PROC" 2>/dev/null || true
-      bash scripts/stop.sh >/dev/null 2>&1 || true
+      cargo run --quiet --bin wayland-macos -- stop >/dev/null 2>&1 || true
     fi
   fi
 }
@@ -61,8 +63,8 @@ command -v python3 >/dev/null   || fail "python3 not found (install the Command 
 
 # 1. Compositor + waypipe + TCP bridge.
 if ! pgrep -x "$PROC" >/dev/null 2>&1; then
-  log "starting the compositor (scripts/mac-side.sh) in the background…"
-  bash scripts/mac-side.sh >"$OUT_DIR/compositor.log" 2>&1 &
+  log "starting the compositor (cargo run) in the background…"
+  cargo run --quiet --bin wayland-macos -- up >"$OUT_DIR/compositor.log" 2>&1 &
   STARTED_COMPOSITOR=1
   sleep 4
 else

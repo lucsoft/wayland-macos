@@ -47,21 +47,27 @@ over plain TCP.
 ## Quick start
 
 ```sh
+# macOS side only: pulseaudio + waypipe client + TCP bridge + the compositor.
+cargo run                             # the wayland-macos orchestrator CLI
+cargo run -- stop                     # tear it all back down
+
 # Everything: macOS side + container app (defaults to gnome-text-editor)
 ./scripts/run.sh                      # or: ./scripts/run.sh gnome-calculator
-
-# Tear down the macOS-side helpers
-./scripts/stop.sh
 ```
 
-`run.sh` starts the compositor, the macOS `waypipe client`, and the TCP bridge,
-then `docker compose run`s the container which launches the app through
-`waypipe server`.
+`cargo run` (the default binary) launches the **`wayland-macos` orchestrator
+CLI**, which brings up the audio bridge, builds/starts the compositor, and — for
+the waypipe back-end — the `waypipe client` + TCP bridge (`cargo run -- stop`
+tears it all down). `run.sh` calls it, then `docker compose run`s the container
+which launches the app through `waypipe server`.
 
 ### Without Docker (compositor only)
 
+The compositor proper is a separate binary, `wayland-macos-core`. Run it alone
+(no waypipe/bridge) to talk to it directly with the test client:
+
 ```sh
-cargo run                                             # terminal 1: compositor
+cargo run --bin wayland-macos-core                    # terminal 1: compositor
 # it prints XDG_RUNTIME_DIR + WAYLAND_DISPLAY to use
 XDG_RUNTIME_DIR=/tmp/wayland-macos-$(id -u) \
   WAYLAND_DISPLAY=wayland-1 cargo run --bin testclient # terminal 2: client
@@ -77,7 +83,7 @@ waypipe is Linux-first. Rather than vendor a full copy, we track upstream as a
   cfg-gated edits to 5 files.
 - **`scripts/build-waypipe.sh`** — clones that commit, applies the patch, builds
   with `--no-default-features`, and writes `bin/waypipe-macos` (git-ignored, so
-  the 1.7 MB binary isn't committed). `mac-side.sh` runs it automatically if the
+  the 1.7 MB binary isn't committed). `cargo run` runs it automatically if the
   binary is missing. To track a newer upstream, bump `WAYPIPE_COMMIT` (in the
   script **and** `docker/Dockerfile`) and re-apply the patch.
 
@@ -122,11 +128,11 @@ container connect to it via `PULSE_SERVER=tcp:host.docker.internal:4713`.
 Linux app ──libpulse──> PULSE_SERVER (tcp) ──> PulseAudio on macOS ──> CoreAudio
 ```
 
-- **Mac side:** `scripts/mac-side.sh` starts the daemon (via
-  `scripts/pulseaudio-mac.sh`, from the `scripts/pulseaudio-mac.pa` config) if
-  `pulseaudio` is installed (`brew install pulseaudio`); otherwise it prints a
-  hint and continues without audio. `scripts/stop.sh` tears it down. The RAIL
-  back-end doesn't use `mac-side.sh`, so start the daemon there by running
+- **Mac side:** `cargo run` starts the daemon (via `scripts/pulseaudio-mac.sh`,
+  from the `scripts/pulseaudio-mac.pa` config) for **either** back-end if
+  `pulseaudio` is installed (`brew install pulseaudio`) and nothing is already
+  serving on TCP 4713; otherwise it prints a hint and continues without audio.
+  `cargo run -- stop` tears it down. You can also run
   `scripts/pulseaudio-mac.sh` directly (idempotent).
 - **Container side:** `docker/entrypoint.sh` (waypipe) and
   `docker/entrypoint-rail.sh` (RAIL) export `PULSE_SERVER` (pointing at

@@ -1,6 +1,10 @@
 //! A minimal Wayland compositor for macOS: each Wayland `xdg_toplevel` becomes a
 //! native `NSWindow`. The Wayland protocol runs on a background thread; AppKit
 //! owns the main thread. See `wayland.rs` and `mac.rs`.
+//!
+//! This is the `wayland-macos-core` binary — the compositor proper. The
+//! user-facing entry point is the `wayland-macos` orchestrator CLI (`src/cli.rs`),
+//! which builds and launches this alongside pulseaudio/waypipe/socat.
 
 mod host;
 mod input;
@@ -66,7 +70,7 @@ fn main() {
     // each host to keep RAIL windows non-resizable.
     mac::RAIL_MODE.store(use_rail, std::sync::atomic::Ordering::Relaxed);
 
-    // --multiplex: hide "wayland-macos" itself and surface each Wayland app as
+    // --multiplex: hide the compositor itself and surface each Wayland app as
     // its own native macOS app (see src/router.rs). The compositor becomes an
     // Accessory (no Dock tile / no Cmd-Tab) and owns no windows; per-app
     // window-host children own the NSWindows.
