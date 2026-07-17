@@ -1,0 +1,175 @@
+name: build
+
+# Pre-builds every macOS binary the pipeline needs so users don't have to compile
+# locally:
+#   - wayland-macos       (the compositor)         — from this crate
+#   - testclient          (the standalone client)  — from this crate
+#   - waypipe-macos       (patched waypipe client) — pinned upstream + docker/waypipe-macos.patch
+#   - wayland-macos-rail  (RAIL/WSLg back-end)      — `--features rail`, links the
+#                          Microsoft FreeRDP 2.x fork built from source (build-rail job)
+#
+# Built for both Apple Silicon (arm64) and Intel (x86_64). On a version tag (v*)
+# the tarballs are attached to a GitHub Release.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed by the release job to create/upload a Release
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14 # Apple Silicon
+            arch: arm64
+          - runner: macos-13 # Intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The compositor links libxkbcommon dynamically (see build.rs); Homebrew
+      # supplies it. xkeyboard-config comes in as a dependency (runtime keymaps).
+      - name: Install Homebrew deps
+        run: brew install libxkbcommon
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      # Caches ~/.cargo and ./target keyed on the toolchain + Cargo.lock.
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build compositor + testclient (release)
+        run: cargo build --release --bins
+
+      - name: Run tests
+        run: cargo test --bin wayland-macos
+
+      # The waypipe checkout+build is expensive and only changes when the pinned
+      # commit or the patch changes — cache it on exactly those inputs.
+      - name: Cache waypipe build
+        uses: actions/cache@v4
+        with:
+          path: .waypipe-build
+          key: waypipe-${{ matrix.arch }}-${{ hashFiles('scripts/build-waypipe.sh', 'docker/waypipe-macos.patch') }}
+
+      - name: Build waypipe client
+        run: bash scripts/build-waypipe.sh
+
+      - name: Stage binaries
+        run: |
+          mkdir -p "dist"
+          cp target/release/wayland-macos "dist/"
+          cp target/release/testclient "dist/"
+          cp bin/waypipe-macos "dist/"
+          ( cd "dist" && shasum -a 256 * > SHA256SUMS )
+          ls -la "dist"
+
+      - name: Package
+        run: tar -C dist -czf "wayland-macos-${{ matrix.arch }}.tar.gz" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wayland-macos-${{ matrix.arch }}
+          path: wayland-macos-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  # Optional RAIL/WSLg back-end (`--features rail`). It links Microsoft's FreeRDP
+  # 2.x fork — upstream/Homebrew FreeRDP 3 does NOT interoperate with WSLg's RAIL
+  # stream — so we build the fork from source into ~/.local/msfreerdp first.
+  #
+  # NOTE: the resulting binary links libfreerdp2 dynamically from that prefix, so
+  # running it on another machine requires the fork installed at the same path
+  # (build it locally with scripts/build-msfreerdp.sh). This job pre-compiles it;
+  # it is not a self-contained bundle.
+  build-rail:
+    name: build rail (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14 # Apple Silicon
+            arch: arm64
+          - runner: macos-13 # Intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # libxkbcommon (compositor) + the MS FreeRDP fork's build toolchain.
+      - name: Install Homebrew deps
+        run: brew install libxkbcommon cmake ninja pkg-config openssl@3
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: rail # keep the rail feature's target dir separate from the default build
+
+      # Building the fork from source is very slow; cache the install prefix and
+      # only rebuild when the build script changes.
+      - name: Cache MS FreeRDP fork
+        id: msfreerdp-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/msfreerdp
+          key: msfreerdp-${{ matrix.arch }}-${{ hashFiles('scripts/build-msfreerdp.sh') }}
+
+      - name: Build MS FreeRDP fork
+        if: steps.msfreerdp-cache.outputs.cache-hit != 'true'
+        run: bash scripts/build-msfreerdp.sh
+
+      - name: Build rail-enabled compositor
+        run: cargo build --release --features rail --bin wayland-macos
+
+      - name: Stage binary
+        run: |
+          mkdir -p "dist-rail"
+          cp target/release/wayland-macos "dist-rail/wayland-macos-rail"
+          ( cd "dist-rail" && shasum -a 256 * > SHA256SUMS )
+          ls -la "dist-rail"
+
+      - name: Package
+        run: tar -C dist-rail -czf "wayland-macos-rail-${{ matrix.arch }}.tar.gz" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wayland-macos-rail-${{ matrix.arch }}
+          path: wayland-macos-rail-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  # One Release per tag, with every arch tarball attached. Kept as a separate job
+  # so the matrix builds don't race to create the same release.
+  release:
+    name: release
+    needs: [build, build-rail]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" artifacts/*.tar.gz --repo "${GITHUB_REPOSITORY}" --generate-notes
