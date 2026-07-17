@@ -23,6 +23,7 @@
 #include <freerdp/input.h>
 
 #define MAX_WINDOWS 256
+#define MAX_SURFACES 256
 
 typedef struct {
     uint32_t id;
@@ -31,11 +32,19 @@ typedef struct {
     int used;
 } rail_window;
 
+/* surfaceId -> windowId association (see rail_map_window_for_surface). */
+typedef struct {
+    uint16_t surface_id;
+    uint32_t window_id;
+    int used;
+} surf_map;
+
 /* Our rdpContext subclass. The base rdpContext MUST be the first member so
  * FreeRDP can cast between them. */
 typedef struct {
     rdpContext context;
     rail_window windows[MAX_WINDOWS];
+    surf_map surfaces[MAX_SURFACES];
 } railContext;
 
 /* Single active session. RAIL is inherently one connection here, and the input
@@ -69,6 +78,46 @@ static rail_window *win_alloc(railContext *rc, uint32_t id) {
         }
     }
     return NULL;
+}
+
+/* ---- surface -> window mapping ----------------------------------------- */
+//
+// WSLg's weston-rdprail backend doesn't send the standard MS-RDPEGFX
+// MapSurfaceToWindow PDU (so FreeRDP's gdi never sets surface->windowId).
+// Instead it uses the WSLg fork's MapWindowForSurface / UnmapWindowForSurface
+// callbacks to associate each rdpgfx surface with a RAIL window. We record that
+// mapping here so multi-window sessions route each surface's content to the
+// correct NSWindow (previously every surface fell back to the last-created
+// window via g_main_window_id, so only one app ever rendered).
+
+static void surf_map_set(railContext *rc, uint16_t surface_id, uint32_t window_id) {
+    surf_map *free_slot = NULL;
+    for (int i = 0; i < MAX_SURFACES; i++) {
+        if (rc->surfaces[i].used && rc->surfaces[i].surface_id == surface_id) {
+            rc->surfaces[i].window_id = window_id;
+            return;
+        }
+        if (!free_slot && !rc->surfaces[i].used)
+            free_slot = &rc->surfaces[i];
+    }
+    if (free_slot) {
+        free_slot->used = 1;
+        free_slot->surface_id = surface_id;
+        free_slot->window_id = window_id;
+    }
+}
+
+static uint32_t surf_map_lookup(railContext *rc, uint16_t surface_id) {
+    for (int i = 0; i < MAX_SURFACES; i++)
+        if (rc->surfaces[i].used && rc->surfaces[i].surface_id == surface_id)
+            return rc->surfaces[i].window_id;
+    return 0;
+}
+
+static void surf_map_clear_window(railContext *rc, uint32_t window_id) {
+    for (int i = 0; i < MAX_SURFACES; i++)
+        if (rc->surfaces[i].used && rc->surfaces[i].window_id == window_id)
+            rc->surfaces[i].used = 0;
 }
 
 /* Convert a RAIL_UNICODE_STRING (UTF-16LE bytes) to a freshly-malloc'd UTF-8
@@ -161,6 +210,10 @@ static BOOL rail_window_delete(rdpContext *context,
     rail_window *w = win_find(rc, oi->windowId);
     if (w)
         w->used = 0;
+    /* Drop any surface mappings for this window (defensive: the server should
+     * also send UnmapWindowForSurface, but a stale mapping would misroute a
+     * recycled surfaceId to a destroyed window). */
+    surf_map_clear_window(rc, oi->windowId);
     g_cb.window_delete(g_cb.user, oi->windowId);
     return TRUE;
 }
@@ -181,10 +234,13 @@ static UINT rail_update_surface_area(RdpgfxClientContext *gfx, UINT16 surfaceId,
     gdiGfxSurface *surface = (gdiGfxSurface *)gfx->GetSurfaceData(gfx, surfaceId);
     if (!surface || !surface->data)
         return CHANNEL_RC_OK;
-    /* Prefer the surface's own window mapping; fall back to the main window when
-     * the content surface arrives unmapped (this WSLg build). */
-    uint32_t win =
-        surface->windowId != 0 ? (uint32_t)surface->windowId : g_main_window_id;
+    /* Resolve the target window: the WSLg MapWindowForSurface mapping first,
+     * then the surface's own windowId (standard MapSurfaceToWindow), and only
+     * as a last resort the most-recent window (single-window fallback). */
+    uint32_t win = g_ctx ? surf_map_lookup(g_ctx, surfaceId) : 0;
+    if (win == 0)
+        win = surface->windowId != 0 ? (uint32_t)surface->windowId
+                                     : g_main_window_id;
     if (win == 0)
         return CHANNEL_RC_OK;
     /* Surfaces are BGRA32 (gdi initialised with PIXEL_FORMAT_BGRA32). The gfx
@@ -208,6 +264,28 @@ static UINT rail_update_surface_area(RdpgfxClientContext *gfx, UINT16 surfaceId,
     }
     g_cb.window_surface(g_cb.user, win, surface->width, surface->height,
                         surface->scanline, surface->data);
+    return CHANNEL_RC_OK;
+}
+
+/* WSLg fork callbacks: the server associates an rdpgfx surface with a RAIL
+ * window through these (not the standard MapSurfaceToWindow PDU). Record the
+ * mapping so rail_update_surface_area routes each surface to the right window.
+ * NOTE: the surface is already locked here — do no gfx calls, only bookkeeping. */
+static UINT rail_map_window_for_surface(RdpgfxClientContext *gfx,
+                                        UINT16 surfaceID, UINT64 windowID) {
+    (void)gfx;
+    fprintf(stderr, "[rail-c] map surface %u -> window %llu\n", surfaceID,
+            (unsigned long long)windowID);
+    if (g_ctx)
+        surf_map_set(g_ctx, surfaceID, (uint32_t)windowID);
+    return CHANNEL_RC_OK;
+}
+
+static UINT rail_unmap_window_for_surface(RdpgfxClientContext *gfx,
+                                          UINT64 windowID) {
+    (void)gfx;
+    if (g_ctx)
+        surf_map_clear_window(g_ctx, (uint32_t)windowID);
     return CHANNEL_RC_OK;
 }
 
@@ -300,6 +378,9 @@ static void on_channel_connected(void *context, ChannelConnectedEventArgs *e) {
         /* Take over per-window surface delivery (RAIL window content). Must be
          * set after gdi_graphics_pipeline_init, which installs the defaults. */
         gfx->UpdateSurfaceArea = rail_update_surface_area;
+        /* WSLg surface<->window association (multi-window routing). */
+        gfx->MapWindowForSurface = rail_map_window_for_surface;
+        gfx->UnmapWindowForSurface = rail_unmap_window_for_surface;
     } else if (strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0) {
         /* We don't implement clipboard, but the addin is loaded (the WSLg server
          * expects it). Give it a non-NULL custom so its caps PDU doesn't error
