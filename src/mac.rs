@@ -62,6 +62,9 @@ pub fn macos_keyboard_layout() -> Option<String> {
     use std::ffi::CStr;
     use std::os::raw::{c_char, c_void};
 
+    // Both frameworks genuinely need `kind = "framework"`; clippy's
+    // duplicated_attributes lint misreads the repeated key as redundant.
+    #[allow(clippy::duplicated_attributes)]
     #[link(name = "Carbon", kind = "framework")]
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
@@ -646,6 +649,9 @@ define_class!(
 );
 
 impl WaylandWindow {
+    // Returns the object as its `NSWindow` base class rather than `Self`; callers
+    // only need the `NSWindow` API surface.
+    #[allow(clippy::new_ret_no_self)]
     fn new(mtm: MainThreadMarker, rect: CGRect, style: NSWindowStyleMask) -> Retained<NSWindow> {
         let this = mtm.alloc::<WaylandWindow>();
         // WaylandWindow doesn't override init, so send the inherited designated
@@ -1221,7 +1227,7 @@ fn restore_focus_under_cursor() {
                 && gm.x <= f.origin.x + f.size.width
                 && gm.y >= f.origin.y
                 && gm.y <= f.origin.y + f.size.height;
-            inside.then(|| (*id, gm.x - f.origin.x, f.size.height - (gm.y - f.origin.y)))
+            inside.then_some((*id, gm.x - f.origin.x, f.size.height - (gm.y - f.origin.y)))
         })
     });
     if let Some((id, x, y)) = target {
@@ -1556,6 +1562,7 @@ fn subsurface_origin(win_h: f64, x: i32, y: i32, lh: f64) -> (f64, f64) {
     (x as f64, win_h - y as f64 - lh)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_window(
     mtm: MainThreadMarker,
     id: u32,

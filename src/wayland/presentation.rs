@@ -22,7 +22,7 @@ impl GlobalDispatch<WpPresentation, ()> for State {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let presentation = data_init.init(resource, ());
-        presentation.clock_id(libc::CLOCK_MONOTONIC as u32);
+        presentation.clock_id(libc::CLOCK_MONOTONIC);
     }
 }
 

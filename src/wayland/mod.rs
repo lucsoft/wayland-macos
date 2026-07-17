@@ -125,9 +125,9 @@ const XDG_TOPLEVEL_ICON_VERSION: u32 = 1;
 // Shared memory
 // ---------------------------------------------------------------------------
 
-/// A client shm pool: an mmap of the fd the client passed via `wl_shm.create_pool`.
-/// The map lives behind an `RwLock` because the pool is shared (`Arc<PoolMem>`)
-/// across its buffers, yet `wl_shm_pool.resize` can re-mmap it to a larger size.
+// A client shm pool: an mmap of the fd the client passed via `wl_shm.create_pool`.
+// The map lives behind an `RwLock` because the pool is shared (`Arc<PoolMem>`)
+// across its buffers, yet `wl_shm_pool.resize` can re-mmap it to a larger size.
 
 mod compositor;
 mod shm;
@@ -838,8 +838,8 @@ impl State {
                 mac::assign_window(t.window_id, app_key, &name, true);
                 mac::post(WinCmd::Create {
                     id: t.window_id,
-                    width: width,
-                    height: height,
+                    width,
+                    height,
                     dst_w,
                     dst_h,
                     decorated: t.wants_ssd,
@@ -864,9 +864,9 @@ impl State {
             }
             mac::post(WinCmd::Frame {
                 id: t.window_id,
-                width: width,
-                height: height,
-                stride: stride,
+                width,
+                height,
+                stride,
                 dst_w,
                 dst_h,
                 pixels,
@@ -903,8 +903,8 @@ impl State {
                     parent_id: parent_window,
                     x: adj_x,
                     y: adj_y,
-                    width: width,
-                    height: height,
+                    width,
+                    height,
                 });
                 if let Some(p) = self.popups.get_mut(&pp_id) {
                     p.created_window = true;
@@ -912,9 +912,9 @@ impl State {
             }
             mac::post(WinCmd::Frame {
                 id: window_id,
-                width: width,
-                height: height,
-                stride: stride,
+                width,
+                height,
+                stride,
                 dst_w,
                 dst_h,
                 pixels,
@@ -1748,15 +1748,16 @@ mod tests {
     /// 1 top, 2 bottom, 5 top_left, 6 bottom_left, 7 top_right, 8 bottom_right.
     #[test]
     fn positioner_anchor_gravity_resolves_popup_origin() {
-        let mut p = PositionerState::default();
-        p.size = (100, 50);
-        p.anchor_rect = (0, 0, 200, 30); // (x, y, w, h)
-
         // bottom-left anchor + bottom-right gravity: popup drops below the rect's
         // bottom-left corner. Anchor point = (0, 30); gravity right/bottom keeps
         // the popup's top-left there.
-        p.anchor = 6;
-        p.gravity = 8;
+        let mut p = PositionerState {
+            size: (100, 50),
+            anchor_rect: (0, 0, 200, 30), // (x, y, w, h)
+            anchor: 6,
+            gravity: 8,
+            ..Default::default()
+        };
         assert_eq!(p.popup_origin(), (0, 30), "bottom-left/bottom-right -> below the rect");
 
         // top anchor + top gravity: popup sits above, centered on the rect's top
