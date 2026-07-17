@@ -32,6 +32,7 @@ RUN printf '%s\n' \
  && apk add --no-cache \
       bash socat \
       dbus dbus-x11 \
+      pulseaudio-utils \
       gnome-console gnome \
       gtk4.0 \
       gdk-pixbuf librsvg \

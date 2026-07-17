@@ -124,6 +124,19 @@ content-sandbox syscalls, else tabs crash); software WebRender via the image's
 Restarting the compositor drops existing client connections; relaunch the
 container afterwards.
 
+## Audio
+
+waypipe forwards only Wayland — **not** audio — so audio takes a separate,
+out-of-band channel that never touches the compositor: a PulseAudio daemon on the
+Mac (`scripts/pulseaudio-mac.pa`, started by `mac-side.sh`) exposes CoreAudio as
+Pulse sinks/sources and listens on TCP 4713; the container's `entrypoint.sh` sets
+`PULSE_SERVER=tcp:${MAC_HOST}:4713` so libpulse clients stream straight to it. The
+Dockerfiles ship the PulseAudio client libs (`pulseaudio-utils`; the Debian image
+adds `gstreamer1.0-pulseaudio` for Qt/GTK media). It's optional and degrades
+cleanly: no `pulseaudio` on the Mac (`brew install pulseaudio`) → `mac-side.sh`
+prints a hint and apps start muted; nothing else breaks. This is not a `bridge/`
+(those live on the Wayland socket) — it bypasses waypipe entirely.
+
 ## Containers
 
 - `docker/Dockerfile` — Alpine + GNOME (newest GTK). Default for `wayland-app`.

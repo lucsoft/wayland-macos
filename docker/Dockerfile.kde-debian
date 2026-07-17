@@ -42,6 +42,7 @@ FROM debian:sid
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash socat \
       dbus dbus-x11 \
+      pulseaudio-utils gstreamer1.0-pulseaudio \
       kwin-wayland \
       plasma-workspace plasma-desktop \
       konsole \

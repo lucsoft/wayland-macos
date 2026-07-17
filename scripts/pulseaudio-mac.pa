@@ -1,0 +1,36 @@
+#!/usr/bin/env -S pulseaudio -nF
+# PulseAudio config for the wayland-macos audio bridge (macOS side).
+#
+# waypipe forwards only the Wayland wire — it carries no audio. So audio takes
+# its own channel: this PulseAudio daemon runs on the Mac, exposes the Mac's
+# CoreAudio devices as Pulse sinks/sources, and listens on TCP. Linux apps in the
+# container connect to it via PULSE_SERVER=tcp:host.docker.internal:4713 (set in
+# docker/entrypoint.sh) and their audio comes out of the Mac's speakers.
+#
+# Started (with `-n`, i.e. WITHOUT the default system config) by
+# scripts/mac-side.sh; stopped by scripts/stop.sh.
+
+.fail
+
+### Expose the Mac's CoreAudio output/input devices as Pulse sinks/sources.
+load-module module-coreaudio-detect
+
+.nofail
+
+### Local UNIX control socket, so `pactl`/`pacmd` on the Mac can introspect and
+### debug this daemon (e.g. `pactl list sinks`).
+load-module module-native-protocol-unix
+
+### Accept connections from the container over TCP. Anonymous auth (no cookie),
+### matching the unauthenticated waypipe TCP bridge — this is a local dev tool.
+###
+### SECURITY: listen=0.0.0.0 is reachable from your LAN, and module-coreaudio
+### also exposes the Mac's *microphone* as a Pulse source. Lock this down if you
+### are not on a trusted network — e.g. add an ACL:
+###   load-module module-native-protocol-tcp auth-anonymous=1 port=4713 \
+###       auth-ip-acl=127.0.0.1;192.168.65.0/24
+### or block the port at the macOS firewall.
+load-module module-native-protocol-tcp auth-anonymous=1 listen=0.0.0.0 port=4713
+
+### Don't hold the audio device open when nothing is playing.
+load-module module-suspend-on-idle

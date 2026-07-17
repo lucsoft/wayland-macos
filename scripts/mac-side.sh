@@ -16,6 +16,35 @@ COMP_LOG="/tmp/wlmac-compositor.log"
 echo "[mac] building compositor..."
 ( cd "$ROOT" && cargo build --quiet )
 
+# 0. audio: a PulseAudio daemon bridging the container's audio to CoreAudio.
+# waypipe carries no audio, so this is a separate channel: the container connects
+# to tcp:host.docker.internal:4713 (see docker/entrypoint.sh) and playback comes
+# out of the Mac's speakers. Optional — skipped (with a hint) if PulseAudio isn't
+# installed, so the rest of the pipeline still works without it.
+PULSE_LOG="/tmp/wlmac-pulseaudio.log"
+if command -v pulseaudio >/dev/null 2>&1; then
+    if pulseaudio --check 2>/dev/null; then
+        echo "[mac] pulseaudio already running"
+    else
+        echo "[mac] starting pulseaudio (CoreAudio bridge) on :4713"
+        # Background it with the SHELL (nohup ... &), NOT PulseAudio's own
+        # --daemonize: its daemonizer double-forks, and CoreAudio's HAL is not
+        # fork-safe on macOS, so the forked daemon dies on startup. A plain
+        # background process keeps the original (unforked) process, which works.
+        # -n: ignore the default system config; -F: run only our script (loads
+        # CoreAudio + the TCP listener). --exit-idle-time=-1: never self-exit.
+        nohup pulseaudio -n -F "$ROOT/scripts/pulseaudio-mac.pa" --exit-idle-time=-1 \
+            >"$PULSE_LOG" 2>&1 &
+        echo $! >/tmp/wlmac-pulseaudio.pid
+        for _ in $(seq 1 50); do pulseaudio --check 2>/dev/null && break; sleep 0.1; done
+        pulseaudio --check 2>/dev/null \
+            || echo "[mac] WARNING: pulseaudio failed to start (see $PULSE_LOG); audio disabled"
+    fi
+else
+    echo "[mac] pulseaudio not found — audio passthrough disabled."
+    echo "[mac]   enable it with:  brew install pulseaudio"
+fi
+
 # Build the waypipe client from pinned upstream + patch if it's not present.
 if [ ! -x "$WAYPIPE" ]; then
     echo "[mac] waypipe client missing; building it"
