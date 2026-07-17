@@ -164,6 +164,13 @@ module, a `State` field, and (if needed) a global in `run`.
     `changeCount`; on a change it pushes the text to the Wayland thread, which
     advertises a fresh `wl_data_offer` to every client. On
     `wl_data_offer.receive` we write the snapshot back into the client's pipe.
+- **Cursor shape** — `wp_cursor_shape_v1` ⇆ `NSCursor` (`src/wayland/cursor_shape.rs`).
+  On `set_shape` we map the requested shape to the closest `NSCursor` via
+  `WinCmd::SetCursor` (`map_cursor` in `mac.rs`); a client-drawn cursor surface
+  is bridged through `WinCmd::SetCursorImage`.
+- **Primary selection** — `zwp_primary_selection_v1`, the X11-style middle-click
+  paste (`src/wayland/primary_selection.rs`). Client-to-client only — macOS has
+  no primary-selection pasteboard, so it never leaves the Wayland side.
 
 ### Existing glue that could become bridges
 
@@ -182,14 +189,13 @@ next additions:
 - **Rich clipboard** — images / RTF / files across `wl_data_offer` MIMEs ⇆
   `NSPasteboardType{PNG,TIFF,RTF,FileURL}` (extends the clipboard bridge).
 - **Drag-and-drop** — `wl_data_device` DnD (`start_drag`) ⇆ `NSDraggingSession`.
-- **Cursor shape** — `wl_pointer.set_cursor` / `cursor-shape-v1` ⇆ `NSCursor`.
 - **Text input / IME** — `text-input-v3` ⇆ `NSTextInputClient` (marked text,
   candidate window).
 - **Idle inhibit** — `idle-inhibit-v1` ⇆ `IOPMAssertion` (keep the display awake).
-- **Pointer lock / relative motion** — `pointer-constraints-v1`,
+- **Pointer lock / relative motion** — `pointer-constraints-v1` /
   `relative-pointer-v1` ⇆ `CGAssociateMouseAndMouseCursorPosition` (for games).
-- **Primary selection** — `primary-selection-v1` ⇆ _no macOS equivalent_
-  (middle-click paste has no native home; would need emulation).
+  The globals are already accepted as inert stubs (enough for KWin to start
+  nested); no real lock/confine or synthesized relative motion yet.
 - **Tablet** — `tablet-v2` ⇆ `NSEvent` pressure/tilt.
 
 ### Out of scope: desktop portals
