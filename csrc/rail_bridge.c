@@ -483,7 +483,12 @@ static UINT rail_on_server_handshake_ex(RailClientContext *rail,
 static UINT rail_on_server_local_move_size(RailClientContext *rail,
                                            const RAIL_LOCALMOVESIZE_ORDER *o) {
     (void)rail;
-    if (o && o->isMoveSizeStart && o->moveSizeType == RAIL_WMSZ_MOVE &&
+    if (!o)
+        return CHANNEL_RC_OK;
+    fprintf(stderr,
+            "[rail-c] LocalMoveSize win=%u start=%d type=0x%04x pos=%d,%d\n",
+            o->windowId, o->isMoveSizeStart, o->moveSizeType, o->posX, o->posY);
+    if (o->isMoveSizeStart && o->moveSizeType == RAIL_WMSZ_MOVE &&
         g_cb.window_move_start)
         g_cb.window_move_start(g_cb.user, o->windowId);
     return CHANNEL_RC_OK;

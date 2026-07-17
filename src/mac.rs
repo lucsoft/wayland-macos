@@ -865,6 +865,12 @@ pub enum WinCmd {
     Title { id: u32, title: String },
     /// Begin an interactive drag of the window (from `xdg_toplevel.move`).
     StartMove { id: u32 },
+    /// Move a window by a delta in logical points (`dx` right, `dy` down). Used
+    /// by the RAIL back-end to mirror a server-side interactive move: weston owns
+    /// the window position and streams new offsets, so the NSWindow follows by
+    /// the same delta (relative avoids screen-origin conversion and any jump from
+    /// the compositor's own initial placement).
+    MoveBy { id: u32, dx: i32, dy: i32 },
     /// Begin an interactive resize on the given edges (from `xdg_toplevel.resize`).
     StartResize { id: u32, edges: u32 },
     /// Create a borderless popup window (menu/dropdown) positioned relative to
@@ -1451,6 +1457,18 @@ fn handle(cmd: WinCmd) {
                     #[allow(deprecated)]
                     app.activateIgnoringOtherApps(true);
                     e.window.makeKeyAndOrderFront(None);
+                }
+            });
+        }
+        WinCmd::MoveBy { id, dx, dy } => {
+            WINDOWS.with(|w| {
+                if let Some(e) = w.borrow().get(&id) {
+                    let f = e.window.frame();
+                    // RDP y grows downward, macOS upward — flip dy.
+                    e.window.setFrameOrigin(CGPoint::new(
+                        f.origin.x + dx as f64,
+                        f.origin.y - dy as f64,
+                    ));
                 }
             });
         }

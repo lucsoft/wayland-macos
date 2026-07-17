@@ -184,6 +184,7 @@ fn target(cmd: &WinCmd) -> Target {
         | WinCmd::Frame { id, .. }
         | WinCmd::Title { id, .. }
         | WinCmd::StartMove { id }
+        | WinCmd::MoveBy { id, .. }
         | WinCmd::StartResize { id, .. }
         | WinCmd::Maximize { id, .. }
         | WinCmd::Fullscreen { id, .. }
