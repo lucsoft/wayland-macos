@@ -25,7 +25,7 @@
 //! code with it and can't drag AppKit/Wayland deps into a plain process launcher.
 
 use std::fs::{self, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -33,12 +33,19 @@ use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use log::{error, info, warn};
+
 const CLIENT_SOCK: &str = "/tmp/waypipe-client.sock";
 const COMP_LOG: &str = "/tmp/wlmac-compositor.log";
 const WAYPIPE_LOG: &str = "/tmp/wlmac-waypipe.log";
 const SOCAT_LOG: &str = "/tmp/wlmac-socat.log";
 
 fn main() {
+    // Log via the `log` facade to stderr, matching the compositor's format
+    // (timestamp, level, target/thread). Targets use `cli`; override with
+    // e.g. `RUST_LOG=cli=debug`. `--help` writes plain stdout, not a log line.
+    init_logger();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("stop") => stop(),
@@ -48,6 +55,24 @@ fn main() {
         // and treat everything as pass-through flags.
         _ => up(&args),
     }
+}
+
+/// stderr logger matching `wayland-macos-core`'s format (timestamp, level,
+/// target/thread). Level defaults to `info`; filter with `RUST_LOG`.
+fn init_logger() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format(|buf, record| {
+            let ts = buf.timestamp();
+            let thread = std::thread::current().name().unwrap_or("?").to_owned();
+            writeln!(
+                buf,
+                "[{ts} {:5} {}/{thread}] {}",
+                record.level(),
+                record.target(),
+                record.args()
+            )
+        })
+        .init();
 }
 
 fn print_help() {
@@ -88,8 +113,7 @@ fn up(flags: &[String]) {
         // RAIL: the compositor is an RDP *client* dialing into the container's
         // Weston RDP server — there's no local Wayland socket, waypipe, or socat
         // bridge (that's the waypipe pipeline). Start the container separately.
-        println!("[wl] RAIL back-end started. Now start the container:");
-        println!("[wl]   docker compose --profile rail up wayland-rail");
+        info!(target: "cli", "RAIL back-end started; now start the container: docker compose --profile rail up wayland-rail");
         return;
     }
 
@@ -100,7 +124,7 @@ fn up(flags: &[String]) {
     start_waypipe_client(&waypipe, &runtime, &display);
     let port = std::env::var("BRIDGE_PORT").unwrap_or_else(|_| "7777".to_string());
     start_socat(&port);
-    println!("[wl] ready. Container should connect to host.docker.internal:{port}");
+    info!(target: "cli", "ready. Container should connect to host.docker.internal:{port}");
 }
 
 /// Start the shared PulseAudio CoreAudio bridge via `scripts/pulseaudio-mac.sh`.
@@ -110,7 +134,7 @@ fn up(flags: &[String]) {
 /// if pulseaudio isn't installed, and writes the pidfile. See that script.
 fn start_pulseaudio(root: Option<&Path>) {
     let Some(script) = root.map(|r| r.join("scripts/pulseaudio-mac.sh")) else {
-        println!("[wl] (no source tree; run scripts/pulseaudio-mac.sh yourself for audio)");
+        warn!(target: "cli", "no source tree; run scripts/pulseaudio-mac.sh yourself for audio");
         return;
     };
     // Inherit stdio so its `[mac]` lines show through; it returns promptly.
@@ -129,12 +153,12 @@ fn ensure_waypipe(root: Option<&Path>) -> PathBuf {
         return waypipe;
     }
     if let Some(root) = root {
-        println!("[wl] waypipe client missing; building it");
+        info!(target: "cli", "waypipe client missing; building it");
         let status = Command::new(root.join("scripts/build-waypipe.sh"))
             .current_dir(root)
             .status();
         if !matches!(status, Ok(s) if s.success()) {
-            eprintln!("[wl] ERROR: build-waypipe.sh failed");
+            error!(target: "cli", "build-waypipe.sh failed");
             std::process::exit(1);
         }
     }
@@ -152,7 +176,7 @@ fn ensure_core(root: Option<&Path>, rail: bool) -> PathBuf {
     let (profile, sibling) = exe_profile_and_sibling("wayland-macos-core");
 
     if let Some(root) = root {
-        println!("[wl] building compositor (wayland-macos-core)...");
+        info!(target: "cli", "building compositor (wayland-macos-core)...");
         let mut args = vec!["build", "--quiet", "--bin", "wayland-macos-core"];
         if profile == "release" {
             args.push("--release");
@@ -163,7 +187,7 @@ fn ensure_core(root: Option<&Path>, rail: bool) -> PathBuf {
         }
         let status = Command::new("cargo").args(&args).current_dir(root).status();
         if !matches!(status, Ok(s) if s.success()) {
-            eprintln!("[wl] ERROR: `cargo build` of wayland-macos-core failed");
+            error!(target: "cli", "`cargo build` of wayland-macos-core failed");
             std::process::exit(1);
         }
         return root.join(format!("target/{profile}/wayland-macos-core"));
@@ -174,7 +198,7 @@ fn ensure_core(root: Option<&Path>, rail: bool) -> PathBuf {
         .filter(|s| s.exists())
         .or_else(|| which("wayland-macos-core"))
         .unwrap_or_else(|| {
-            eprintln!("[wl] ERROR: can't find the wayland-macos-core binary");
+            error!(target: "cli", "can't find the wayland-macos-core binary");
             std::process::exit(1);
         })
 }
@@ -182,24 +206,24 @@ fn ensure_core(root: Option<&Path>, rail: bool) -> PathBuf {
 /// Start the compositor if it isn't already running.
 fn start_compositor(core: &Path, multiplex: bool, rail: bool) {
     if compositor_running() {
-        println!("[wl] compositor already running");
+        info!(target: "cli", "compositor already running");
         return;
     }
     let mut args: Vec<&str> = Vec::new();
     if multiplex {
-        println!("[wl] multiplex = on (per-app window hosts)");
+        info!(target: "cli", "multiplex = on (per-app window hosts)");
         args.push("--multiplex");
     }
     if rail {
         args.push("--use-microsoft-rail-protocol");
     }
-    println!("[wl] starting compositor {}", args.join(" "));
+    info!(target: "cli", "starting compositor {}", args.join(" "));
     // Fresh log so socket discovery reads THIS run's announcement.
     let _ = fs::write(COMP_LOG, b"");
     match spawn_detached(&core.to_string_lossy(), &args, COMP_LOG, &[]) {
         Ok(pid) => write_pid("compositor", pid),
         Err(e) => {
-            eprintln!("[wl] ERROR: failed to start compositor ({e})");
+            error!(target: "cli", "failed to start compositor ({e})");
             std::process::exit(1);
         }
     }
@@ -225,10 +249,10 @@ fn discover_socket() -> (String, String) {
         !runtime.is_empty() && !display.is_empty()
     });
     if !found {
-        eprintln!("[wl] ERROR: compositor didn't announce its socket (see {COMP_LOG})");
+        error!(target: "cli", "compositor didn't announce its socket (see {COMP_LOG})");
         std::process::exit(1);
     }
-    println!("[wl] compositor display: {runtime}/{display}");
+    info!(target: "cli", "compositor display: {runtime}/{display}");
     (runtime, display)
 }
 
@@ -238,7 +262,7 @@ fn start_waypipe_client(waypipe: &Path, runtime: &str, display: &str) {
         .args(["-f", "waypipe-macos.*client"])
         .status();
     let _ = fs::remove_file(CLIENT_SOCK);
-    println!("[wl] starting waypipe client on {CLIENT_SOCK}");
+    info!(target: "cli", "starting waypipe client on {CLIENT_SOCK}");
     let child = spawn_detached(
         &waypipe.to_string_lossy(),
         &["-c", "none", "--no-gpu", "-s", CLIENT_SOCK, "client"],
@@ -251,7 +275,7 @@ fn start_waypipe_client(waypipe: &Path, runtime: &str, display: &str) {
     match child {
         Ok(pid) => write_pid("waypipe", pid),
         Err(e) => {
-            eprintln!("[wl] ERROR: failed to start waypipe client ({e})");
+            error!(target: "cli", "failed to start waypipe client ({e})");
             std::process::exit(1);
         }
     }
@@ -262,7 +286,7 @@ fn start_socat(port: &str) {
     let _ = Command::new("pkill")
         .args(["-f", &format!("socat TCP-LISTEN:{port}")])
         .status();
-    println!("[wl] starting TCP bridge on :{port} -> {CLIENT_SOCK}");
+    info!(target: "cli", "starting TCP bridge on :{port} -> {CLIENT_SOCK}");
     // nodelay: disable Nagle on the TCP side (see docker/entrypoint.sh) so small
     // Wayland replies aren't stalled ~hundreds of ms.
     let child = spawn_detached(
@@ -276,7 +300,7 @@ fn start_socat(port: &str) {
     );
     match child {
         Ok(pid) => write_pid("socat", pid),
-        Err(e) => eprintln!("[wl] ERROR: failed to start socat bridge ({e})"),
+        Err(e) => error!(target: "cli", "failed to start socat bridge ({e})"),
     }
 }
 
@@ -315,7 +339,7 @@ fn stop() {
                 .map(|s| s.success())
                 .unwrap_or(false)
             {
-                println!("[stop] killed {name}");
+                info!(target: "cli", "killed {name}");
             }
         }
         let _ = fs::remove_file(&pidfile);
@@ -338,10 +362,10 @@ fn stop() {
             .map(|s| s.success())
             .unwrap_or(false)
     {
-        println!("[stop] killed pulseaudio");
+        info!(target: "cli", "killed pulseaudio");
     }
     let _ = fs::remove_file("/tmp/wlmac-pulseaudio.pid");
-    println!("[stop] done");
+    info!(target: "cli", "done");
 }
 
 // ---------------------------------------------------------------------------
