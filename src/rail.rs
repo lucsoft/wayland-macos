@@ -68,6 +68,9 @@ mod imp {
         window_surface: extern "C" fn(*mut c_void, u32, u32, u32, u32, *const u8),
         disconnected: extern "C" fn(*mut c_void),
         window_move_start: extern "C" fn(*mut c_void, u32),
+        cursor: extern "C" fn(*mut c_void, u32, u32, u32, u32, u32, *const u8),
+        cursor_hidden: extern "C" fn(*mut c_void),
+        cursor_default: extern "C" fn(*mut c_void),
         log: extern "C" fn(*mut c_void, c_int, *const c_char),
     }
 
@@ -216,6 +219,47 @@ mod imp {
         mac::post(WinCmd::StartMove { id });
     }
 
+    /// The server changed the cursor to a bitmap (RDP pointer update). Turn it
+    /// into the shared `SetCursorImage` path, which builds an NSCursor and applies
+    /// it via the views' cursor rects (cursor state is global on the mac side, so
+    /// this isn't per-window). Like RAIL surfaces, the bitmap is scale-1 pixels
+    /// and its hotspot is in those pixels; `make_cursor` scales by the Mac backing
+    /// factor, matching how window content is treated (see on_window_create).
+    extern "C" fn on_cursor(
+        _user: *mut c_void,
+        w: u32,
+        h: u32,
+        stride: u32,
+        hotspot_x: u32,
+        hotspot_y: u32,
+        pixels: *const u8,
+    ) {
+        if pixels.is_null() || w == 0 || h == 0 {
+            return;
+        }
+        let len = stride as usize * h as usize;
+        let pixels = unsafe { std::slice::from_raw_parts(pixels, len) }.to_vec();
+        mac::post(WinCmd::SetCursorImage {
+            width: w as i32,
+            height: h as i32,
+            stride: stride as i32,
+            hotspot_x: hotspot_x as i32,
+            hotspot_y: hotspot_y as i32,
+            pixels,
+        });
+    }
+
+    /// The server hid the cursor (null pointer).
+    extern "C" fn on_cursor_hidden(_user: *mut c_void) {
+        mac::post(WinCmd::HideCursor);
+    }
+
+    /// The server asked for the default cursor; map to the system arrow (shape 1
+    /// falls through to `NSCursor::arrowCursor` in `map_cursor`).
+    extern "C" fn on_cursor_default(_user: *mut c_void) {
+        mac::post(WinCmd::SetCursor { shape: 1 });
+    }
+
     extern "C" fn on_disconnected(_user: *mut c_void) {
         warn!(target: "rail", "RDP session disconnected");
         // The session is gone; close every window it opened. Draining the list
@@ -301,6 +345,9 @@ mod imp {
                 window_surface: on_window_surface,
                 disconnected: on_disconnected,
                 window_move_start: on_window_move_start,
+                cursor: on_cursor,
+                cursor_hidden: on_cursor_hidden,
+                cursor_default: on_cursor_default,
                 log: on_log,
             };
             let rc = unsafe {

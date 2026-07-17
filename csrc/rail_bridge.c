@@ -22,6 +22,8 @@
 #include <freerdp/channels/cliprdr.h> /* CLIPRDR_SVC_CHANNEL_NAME */
 #include <freerdp/client/cmdline.h> /* freerdp_client_load_addins (2.x) */
 #include <freerdp/codec/color.h>
+#include <freerdp/graphics.h> /* graphics_register_pointer + rdpPointer */
+#include <freerdp/pointer.h>
 #include <freerdp/input.h>
 
 #define MAX_WINDOWS 256
@@ -316,6 +318,95 @@ static BOOL rail_end_paint(rdpContext *context) {
     return TRUE;
 }
 
+/* ---- pointer (cursor shape) -------------------------------------------- */
+//
+// Cursor updates arrive as RDP pointer PDUs, independent of window content.
+// FreeRDP's pointer cache decodes/caches them and drives the client-facing
+// rdpPointer graphics callbacks below (as any FreeRDP client does — a bare
+// context registers none, so without this the cursor never changes). `New`
+// converts the AND/XOR masks to BGRA once; `Set` hands that bitmap to Rust,
+// which turns it into an NSCursor. SetNull/SetDefault map to hide/arrow.
+
+/* rdpPointer subclass: the base struct MUST be first so FreeRDP can cast. */
+typedef struct {
+    rdpPointer pointer;
+    BYTE *bgra; /* premultiplied BGRA image, width*height*4, or NULL */
+} railPointer;
+
+static BOOL rail_pointer_new(rdpContext *context, rdpPointer *pointer) {
+    railPointer *rp = (railPointer *)pointer;
+    rp->bgra = NULL;
+    if (pointer->width == 0 || pointer->height == 0)
+        return TRUE;
+    size_t size = (size_t)pointer->width * pointer->height * 4;
+    rp->bgra = (BYTE *)malloc(size);
+    if (!rp->bgra)
+        return FALSE;
+    rdpGdi *gdi = context->gdi;
+    if (!freerdp_image_copy_from_pointer_data(
+            rp->bgra, PIXEL_FORMAT_BGRA32, pointer->width * 4, 0, 0,
+            pointer->width, pointer->height, pointer->xorMaskData,
+            pointer->lengthXorMask, pointer->andMaskData, pointer->lengthAndMask,
+            pointer->xorBpp, gdi ? &gdi->palette : NULL)) {
+        free(rp->bgra);
+        rp->bgra = NULL;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void rail_pointer_free(rdpContext *context, rdpPointer *pointer) {
+    (void)context;
+    railPointer *rp = (railPointer *)pointer;
+    free(rp->bgra);
+    rp->bgra = NULL;
+}
+
+static BOOL rail_pointer_set(rdpContext *context, const rdpPointer *pointer) {
+    (void)context;
+    const railPointer *rp = (const railPointer *)pointer;
+    if (rp->bgra && pointer->width > 0 && pointer->height > 0 && g_cb.cursor)
+        g_cb.cursor(g_cb.user, pointer->width, pointer->height,
+                    pointer->width * 4, pointer->xPos, pointer->yPos, rp->bgra);
+    return TRUE;
+}
+
+static BOOL rail_pointer_set_null(rdpContext *context) {
+    (void)context;
+    if (g_cb.cursor_hidden)
+        g_cb.cursor_hidden(g_cb.user);
+    return TRUE;
+}
+
+static BOOL rail_pointer_set_default(rdpContext *context) {
+    (void)context;
+    if (g_cb.cursor_default)
+        g_cb.cursor_default(g_cb.user);
+    return TRUE;
+}
+
+/* RAIL is a local-cursor model — the user's real mouse drives the pointer, so
+ * we don't warp it to the server's position. Accept the update as a no-op. */
+static BOOL rail_pointer_set_position(rdpContext *context, UINT32 x, UINT32 y) {
+    (void)context;
+    (void)x;
+    (void)y;
+    return TRUE;
+}
+
+static void rail_register_pointer(rdpGraphics *graphics) {
+    rdpPointer p;
+    memset(&p, 0, sizeof(p));
+    p.size = sizeof(railPointer);
+    p.New = rail_pointer_new;
+    p.Free = rail_pointer_free;
+    p.Set = rail_pointer_set;
+    p.SetNull = rail_pointer_set_null;
+    p.SetDefault = rail_pointer_set_default;
+    p.SetPosition = rail_pointer_set_position;
+    graphics_register_pointer(graphics, &p);
+}
+
 /* ---- RAIL handshake ---------------------------------------------------- */
 //
 // After the RDP session goes active the server sends a RAIL Handshake. The
@@ -462,6 +553,10 @@ static BOOL rail_post_connect(freerdp *instance) {
     rdpContext *ctx = instance->context;
     if (!gdi_init(instance, PIXEL_FORMAT_BGRA32))
         return FALSE;
+
+    /* Register cursor-shape callbacks so server pointer updates change the
+     * local NSCursor (the pointer cache drives these). */
+    rail_register_pointer(ctx->graphics);
 
     rdpUpdate *update = ctx->update;
     update->EndPaint = rail_end_paint;

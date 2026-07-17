@@ -43,6 +43,15 @@ typedef struct {
      * the app's own titlebar (RAIL Server Local Move/Size, type MOVE). The Rust
      * side turns this into a native NSWindow drag. */
     void (*window_move_start)(void *user, uint32_t id);
+    /* The server changed the mouse cursor to a bitmap. `pixels` is 32-bit BGRA,
+     * `w`x`h` at `stride` bytes/row; (`hotspot_x`, `hotspot_y`) is the click
+     * point within it. Valid only for the duration of the call. */
+    void (*cursor)(void *user, uint32_t w, uint32_t h, uint32_t stride,
+                   uint32_t hotspot_x, uint32_t hotspot_y, const uint8_t *pixels);
+    /* Hide the cursor (server set a NULL/empty pointer). */
+    void (*cursor_hidden)(void *user);
+    /* Reset to the default system cursor (arrow). */
+    void (*cursor_default)(void *user);
     /* Emit a bridge log line through Rust's `log` facade so it shares the
      * compositor's format/filtering. `level` is a RAIL_LOG_* severity (see
      * rail_bridge.c); `msg` is a NUL-terminated, already-formatted string valid
