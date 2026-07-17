@@ -75,6 +75,17 @@ mod imp {
         window_icon: extern "C" fn(*mut c_void, u32, u32, u32, u32, *const u8),
     }
 
+    /// Mirrors `rail_monitor` in csrc/rail_bridge.h.
+    #[repr(C)]
+    struct RailMonitor {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        scale: u32,
+        is_primary: i32,
+    }
+
     extern "C" {
         fn rail_run(
             host: *const c_char,
@@ -83,6 +94,8 @@ mod imp {
             desktop_w: u32,
             desktop_h: u32,
             scale: u32,
+            monitors: *const RailMonitor,
+            monitor_count: u32,
             cb: *const RailCallbacks,
         ) -> c_int;
         fn rail_send_pointer(window_id: u32, local_x: i32, local_y: i32, flags: u16);
@@ -95,6 +108,22 @@ mod imp {
     /// destroy whatever is still live here (otherwise the NSWindows linger with
     /// a frozen last frame). Touched from the FreeRDP event-loop thread only.
     static LIVE_WINDOWS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+    /// Global render scale advertised to weston (the primary monitor's backing
+    /// factor). weston reports window geometry/positions in physical pixels at
+    /// this scale, so the callbacks divide by it to get logical points. Set once
+    /// in `run()` before the FreeRDP thread starts.
+    static RAIL_SCALE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
+    fn rail_scale() -> i32 {
+        RAIL_SCALE.load(std::sync::atomic::Ordering::Relaxed).max(1)
+    }
+
+    /// Each window's logical size in points (physical geometry ÷ scale), tracked
+    /// from the window orders. Used as the present destination so a HiDPI buffer
+    /// (a 2x app on a Retina display) is shown crisp at its logical size.
+    static WIN_LOGICAL: Mutex<std::collections::BTreeMap<u32, (i32, i32)>> =
+        Mutex::new(std::collections::BTreeMap::new());
 
     fn cstr(p: *const c_char) -> String {
         if p.is_null() {
@@ -127,8 +156,16 @@ mod imp {
             return;
         }
         let name = cstr(title);
-        info!(target: "rail", "window create id={id} {w}x{h} title={name:?}");
+        // weston reports geometry in physical pixels at the advertised scale;
+        // convert to logical points for the (scale-agnostic) AppKit side.
+        let s = rail_scale();
+        let (lw, lh) = ((w as i32 / s).max(1), (h as i32 / s).max(1));
+        info!(target: "rail", "window create id={id} {w}x{h} (logical {lw}x{lh}) title={name:?}");
         LIVE_WINDOWS.lock().unwrap().push(id);
+        WIN_LOGICAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, (lw, lh));
         // --multiplex: give each RAIL toplevel its own per-app window-host (its
         // own Dock tile / Cmd-Tab entry). RAIL has no per-window app id in this
         // build, so key the host by the window id (one tile per window) and name
@@ -138,12 +175,10 @@ mod imp {
         mac::assign_window(id, id, display, true);
         mac::post(WinCmd::Create {
             id,
-            width: w as i32,
-            height: h as i32,
-            // Treat RAIL (scale-1) pixels as points so the window is normal size
-            // and view points map 1:1 to surface pixels (correct click mapping).
-            dst_w: w as i32,
-            dst_h: h as i32,
+            width: lw,
+            height: lh,
+            dst_w: lw,
+            dst_h: lh,
             // RAIL surfaces already include the app's own decorations (CSD —
             // e.g. weston-terminal's titlebar), so the NSWindow must be
             // borderless. Adding a native titlebar here double-decorates.
@@ -153,8 +188,8 @@ mod imp {
         });
         // Place at weston's chosen position so the mirror is aligned from the
         // start (no jump on the first move, and weston's edges map to the
-        // screen's — see WinCmd::Move).
-        mac::post(WinCmd::Move { id, x, y });
+        // screen's — see WinCmd::Move). Position is physical → logical.
+        mac::post(WinCmd::Move { id, x: x / s, y: y / s });
     }
 
     extern "C" fn on_window_update(
@@ -162,14 +197,21 @@ mod imp {
         id: u32,
         x: i32,
         y: i32,
-        _w: u32,
-        _h: u32,
+        w: u32,
+        h: u32,
     ) {
         // weston does a server-side interactive move: it owns the window position
-        // and streams new offsets here. Mirror them onto the NSWindow so it
-        // follows the drag. (Size follows the next surface frame, which resizes
-        // the NSWindow to the buffer, so we ignore w/h.)
-        mac::post(WinCmd::Move { id, x, y });
+        // and streams new offsets here (physical pixels). Mirror them onto the
+        // NSWindow so it follows the drag, converting to logical points; and keep
+        // the tracked logical size current for surface presentation.
+        let s = rail_scale();
+        if w > 0 && h > 0 {
+            WIN_LOGICAL
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id, ((w as i32 / s).max(1), (h as i32 / s).max(1)));
+        }
+        mac::post(WinCmd::Move { id, x: x / s, y: y / s });
     }
 
     extern "C" fn on_window_title(_user: *mut c_void, id: u32, title: *const c_char) {
@@ -208,6 +250,10 @@ mod imp {
     extern "C" fn on_window_delete(_user: *mut c_void, id: u32) {
         info!(target: "rail", "window delete id={id}");
         LIVE_WINDOWS.lock().unwrap().retain(|&w| w != id);
+        WIN_LOGICAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
         mac::post(WinCmd::Destroy { id });
     }
 
@@ -222,10 +268,17 @@ mod imp {
         if pixels.is_null() || w == 0 || h == 0 {
             return;
         }
-        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-        if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            debug!(target: "rail", "first surface frame id={id} {w}x{h} stride={stride}");
-        }
+        // Present the buffer at the window's logical size: a HiDPI-aware app on a
+        // 2x display renders a 2x buffer, shown crisp at its logical points; a
+        // non-aware app renders 1x, shown ~1:1. Fall back to buffer÷scale if we
+        // have no tracked size yet.
+        let s = rail_scale();
+        let (dst_w, dst_h) = WIN_LOGICAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .copied()
+            .unwrap_or(((w as i32 / s).max(1), (h as i32 / s).max(1)));
         let len = stride as usize * h as usize;
         let pixels = unsafe { std::slice::from_raw_parts(pixels, len) }.to_vec();
         mac::post(WinCmd::Frame {
@@ -233,9 +286,8 @@ mod imp {
             width: w as i32,
             height: h as i32,
             stride: stride as i32,
-            // scale-1 pixels as points (see on_window_create): 1:1 point↔pixel.
-            dst_w: w as i32,
-            dst_h: h as i32,
+            dst_w,
+            dst_h,
             pixels,
             // RAIL/gfx surfaces are ordinary 8-bit BGRA (SDR); no HDR metadata.
             format: mac::PixelFormat::Bgra8888,
@@ -354,16 +406,42 @@ mod imp {
         let (wake_r, wake_w) = waker_pipe();
         bus.set_waker(wake_w);
 
-        // Advertise the Mac's real display so the server sizes its desktop to our
-        // monitor (not a hardcoded 1920x1080). output_size() is physical px; send
-        // the *logical* size at scale 1 — advertising scale 2 doubles the window
-        // geometry but non-HiDPI apps (weston-terminal) still render 1x, giving a
-        // huge blurry window. (True per-app HiDPI is a separate change.)
+        // Render scale: weston-mirror scales globally (not per-monitor), so use
+        // the PRIMARY monitor's backing factor. A HiDPI-aware app then renders
+        // crisp on a Retina primary; windows on a standard monitor render at the
+        // same scale (correct size, softness varies). The desktop is advertised
+        // in PHYSICAL pixels at that scale so weston's 2x geometry fits.
         let mac_scale = crate::input::scale().max(1);
         let (phys_w, phys_h) = crate::input::output_size();
-        let out_w = (phys_w / mac_scale).max(1);
-        let out_h = (phys_h / mac_scale).max(1);
-        let scale = 1u32;
+        let logical_w = (phys_w / mac_scale).max(1);
+        let logical_h = (phys_h / mac_scale).max(1);
+        let mons = crate::input::monitors();
+        let s = mons
+            .iter()
+            .find(|m| m.primary)
+            .map(|m| m.scale)
+            .unwrap_or(mac_scale)
+            .max(1);
+        RAIL_SCALE.store(s, std::sync::atomic::Ordering::Relaxed);
+        let out_w = logical_w * s;
+        let out_h = logical_h * s;
+        let scale = s as u32;
+
+        // Monitor layout, in the physical (×s) desktop space to match. weston
+        // ignores the per-monitor scale (global only) but uses the geometry to lay
+        // the displays out, which keeps cross-monitor dragging aligned.
+        let monitors: Vec<RailMonitor> = mons
+            .iter()
+            .map(|m| RailMonitor {
+                x: m.x * s,
+                y: m.y * s,
+                width: (m.width.max(1) * s) as u32,
+                height: (m.height.max(1) * s) as u32,
+                scale: s as u32,
+                is_primary: m.primary as i32,
+            })
+            .collect();
+        info!(target: "rail", "advertising {} monitor(s), desktop {out_w}x{out_h} scale={s}", monitors.len());
 
         // FreeRDP event loop on its own thread (blocking).
         let host_c = CString::new(host).expect("host");
@@ -392,6 +470,8 @@ mod imp {
                     out_w as u32,
                     out_h as u32,
                     scale,
+                    monitors.as_ptr(),
+                    monitors.len() as u32,
                     &cb,
                 )
             };

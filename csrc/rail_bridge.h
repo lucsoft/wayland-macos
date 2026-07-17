@@ -71,11 +71,27 @@ typedef struct {
 #define RAIL_LOG_INFO  2
 #define RAIL_LOG_DEBUG 3
 
+/* One physical display for the RDP monitor layout. Geometry is in logical
+ * points, RAIL-desktop space (top-left origin). `scale` is the backing factor
+ * (1 or 2) → per-monitor desktopScaleFactor, so weston renders each monitor's
+ * windows at its DPI. */
+typedef struct {
+    int32_t x;
+    int32_t y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t scale;
+    int32_t is_primary;
+} rail_monitor;
+
 /* Connect to host:port, launch/attach the RemoteApp `app`, and run the FreeRDP
  * event loop until disconnect or rail_stop(). Blocking — call on a dedicated
- * thread. Returns 0 on a clean session, non-zero on connect failure. */
+ * thread. Returns 0 on a clean session, non-zero on connect failure.
+ * `monitors`/`monitor_count` describe the per-monitor layout (may be NULL/0 for
+ * a single flat desktop of `desktop_w`x`desktop_h`). */
 int rail_run(const char *host, int port, const char *app, uint32_t desktop_w,
-             uint32_t desktop_h, uint32_t scale, const rail_callbacks *cb);
+             uint32_t desktop_h, uint32_t scale, const rail_monitor *monitors,
+             uint32_t monitor_count, const rail_callbacks *cb);
 
 /* Forward a pointer event for a window. `local_x`/`local_y` are surface-local
  * pixels (top-left origin); the bridge adds the window's desktop offset.

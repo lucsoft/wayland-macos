@@ -618,7 +618,8 @@ static void rail_client_free(freerdp *instance, rdpContext *context) {
 /* ---- public API -------------------------------------------------------- */
 
 int rail_run(const char *host, int port, const char *app, uint32_t desktop_w,
-             uint32_t desktop_h, uint32_t scale, const rail_callbacks *cb) {
+             uint32_t desktop_h, uint32_t scale, const rail_monitor *monitors,
+             uint32_t monitor_count, const rail_callbacks *cb) {
     setvbuf(stderr, NULL, _IONBF, 0); /* unbuffered so diagnostics flush live */
     g_rail_started = 0;
     g_rail = NULL;
@@ -711,6 +712,39 @@ int rail_run(const char *host, int port, const char *app, uint32_t desktop_w,
     if (scale >= 1) {
         freerdp_settings_set_uint32(s, FreeRDP_DesktopScaleFactor, scale * 100);
         freerdp_settings_set_uint32(s, FreeRDP_DeviceScaleFactor, 100);
+    }
+
+    /* Per-monitor layout: tell weston each display's geometry + DPI so it renders
+     * a window at the scale of the monitor it's on (WSLg-style per-monitor HiDPI).
+     * Geometry is logical points in the RAIL desktop space; desktopScaleFactor
+     * carries the per-monitor scale. FreeRDP pre-allocates MonitorDefArray. */
+    if (monitors && monitor_count > 0) {
+        rdpMonitor *arr = s->MonitorDefArray;
+        if (arr && monitor_count <= s->MonitorDefArraySize) {
+            for (uint32_t i = 0; i < monitor_count; i++) {
+                memset(&arr[i], 0, sizeof(rdpMonitor));
+                arr[i].x = monitors[i].x;
+                arr[i].y = monitors[i].y;
+                arr[i].width = (INT32)monitors[i].width;
+                arr[i].height = (INT32)monitors[i].height;
+                arr[i].is_primary = monitors[i].is_primary ? 1 : 0;
+                arr[i].orig_screen = i;
+                arr[i].attributes.desktopScaleFactor =
+                    monitors[i].scale >= 1 ? monitors[i].scale * 100 : 100;
+                arr[i].attributes.deviceScaleFactor = 100;
+                fprintf(stderr,
+                        "[rail-c] monitor %u: %d,%d %ux%u scale=%u%% primary=%d\n",
+                        i, monitors[i].x, monitors[i].y, monitors[i].width,
+                        monitors[i].height, arr[i].attributes.desktopScaleFactor,
+                        arr[i].is_primary);
+            }
+            freerdp_settings_set_uint32(s, FreeRDP_MonitorCount, monitor_count);
+            freerdp_settings_set_bool(s, FreeRDP_UseMultimon, TRUE);
+        } else {
+            fprintf(stderr,
+                    "[rail-c] monitor layout skipped (cap=%u count=%u)\n",
+                    s->MonitorDefArraySize, monitor_count);
+        }
     }
 
     if (!freerdp_connect(instance)) {

@@ -52,6 +52,32 @@ pub fn set_output_size(w: i32, h: i32) {
     OUTPUT_H.store(h.max(1), Ordering::Relaxed);
 }
 
+/// One physical display, as the RAIL back-end advertises it to weston. Geometry
+/// is in **logical points**, in the RAIL desktop's coordinate space (top-left
+/// origin, y down, origin at the union bounding box's top-left). `scale` is the
+/// backing factor (1 or 2). Gathered on the main thread (`main.rs`, from
+/// `NSScreen`) and read by the RAIL thread to build the RDP monitor layout so
+/// weston can render each window at its monitor's DPI.
+#[derive(Clone, Copy, Debug)]
+pub struct MonitorInfo {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub scale: i32,
+    pub primary: bool,
+}
+
+static MONITORS: Mutex<Vec<MonitorInfo>> = Mutex::new(Vec::new());
+
+pub fn set_monitors(m: Vec<MonitorInfo>) {
+    *MONITORS.lock().unwrap_or_else(|e| e.into_inner()) = m;
+}
+
+pub fn monitors() -> Vec<MonitorInfo> {
+    MONITORS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Work-area insets (logical points) reserved by docked bars (layer-shell
 /// exclusive zones): (top, right, bottom, left). Toplevels avoid these so they
 /// don't sit under a bar.

@@ -59,6 +59,40 @@ fn screen_union_size(mtm: MainThreadMarker) -> Option<(f64, f64)> {
     (min_x.is_finite() && max_x.is_finite()).then_some((max_x - min_x, max_y - min_y))
 }
 
+/// Per-monitor layout for RAIL (logical points, RAIL-desktop coordinate space:
+/// top-left origin, y down, origin at the union bounding box's top-left). Each
+/// entry carries its backing scale so the RDP monitor layout can tell weston to
+/// render that monitor's windows at its DPI. See `input::MonitorInfo`.
+fn screen_monitors(mtm: MainThreadMarker) -> Vec<input::MonitorInfo> {
+    let screens = NSScreen::screens(mtm);
+    // Union top-left in macOS global (bottom-left) coords.
+    let (mut min_x, mut max_top) = (f64::MAX, f64::MIN);
+    for s in screens.iter() {
+        let f = s.frame();
+        min_x = min_x.min(f.origin.x);
+        max_top = max_top.max(f.origin.y + f.size.height);
+    }
+    let main = NSScreen::mainScreen(mtm);
+    screens
+        .iter()
+        .map(|s| {
+            let f = s.frame();
+            let primary = main
+                .as_ref()
+                .map(|m| m.frame().origin == f.origin)
+                .unwrap_or(false);
+            input::MonitorInfo {
+                x: (f.origin.x - min_x) as i32,
+                y: (max_top - (f.origin.y + f.size.height)) as i32,
+                width: f.size.width as i32,
+                height: f.size.height as i32,
+                scale: (s.backingScaleFactor().round() as i32).max(1),
+                primary,
+            }
+        })
+        .collect()
+}
+
 fn main() {
     // Log to stderr via the `log` facade. Default level is `info`; override per
     // target with e.g. `RUST_LOG=wl=debug,mac=info`. Targets mirror the former
@@ -131,6 +165,12 @@ fn main() {
     };
     if let Some((w, h)) = out_frame {
         input::set_output_size((w as i32) * scale, (h as i32) * scale);
+    }
+    // RAIL advertises a per-monitor layout so weston renders each window at its
+    // monitor's DPI (WSLg-style). Gathered here on the main thread (NSScreen is
+    // main-thread-only); the RAIL thread reads it via input::monitors().
+    if use_rail {
+        input::set_monitors(screen_monitors(mtm));
     }
 
     // Detect the macOS keyboard layout HERE, on the main thread, and cache it.
