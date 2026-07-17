@@ -114,9 +114,14 @@ mod imp {
             id,
             width: w as i32,
             height: h as i32,
-            dst_w: w as i32,
-            dst_h: h as i32,
-            decorated: true,
+            // dst 0: size the window from buffer pixels / output scale (like a
+            // Wayland CSD window), not from raw pixels-as-points.
+            dst_w: 0,
+            dst_h: 0,
+            // RAIL surfaces already include the app's own decorations (CSD —
+            // e.g. weston-terminal's titlebar), so the NSWindow must be
+            // borderless. Adding a native titlebar here double-decorates.
+            decorated: false,
             title: cstr(title),
             geom: (0, 0, 0, 0),
         });
@@ -169,8 +174,9 @@ mod imp {
             width: w as i32,
             height: h as i32,
             stride: stride as i32,
-            dst_w: w as i32,
-            dst_h: h as i32,
+            // dst 0: derive logical size from buffer pixels / output scale.
+            dst_w: 0,
+            dst_h: 0,
             pixels,
             // RAIL/gfx surfaces are ordinary 8-bit BGRA (SDR); no HDR metadata.
             format: mac::PixelFormat::Bgra8888,

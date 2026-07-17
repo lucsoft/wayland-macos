@@ -725,10 +725,14 @@ define_class!(
             // that's `window + margin`, which present_frame would then grow the
             // window to — a runaway loop. Subtracting the margin makes the returned
             // buffer match the current window size, so it settles immediately.
+            // try_borrow, not borrow: setContentSize in present_frame runs inside
+            // WINDOWS.borrow_mut() and synchronously re-enters here — a plain
+            // borrow would panic (double borrow). In that case the margin we'd
+            // read is the one present_frame just set, so falling back is fine.
             let (mw, mh) = WINDOWS.with(|wm| {
-                wm.borrow()
-                    .get(&self.ivars().window_id)
-                    .map(|e| e.csd_margin)
+                wm.try_borrow()
+                    .ok()
+                    .and_then(|m| m.get(&self.ivars().window_id).map(|e| e.csd_margin))
                     .unwrap_or((0, 0))
             });
             push(InputEvent::Resize {
