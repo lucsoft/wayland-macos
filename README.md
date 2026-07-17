@@ -208,23 +208,16 @@ ordinary Wayland surface and already shows up as a native `NSWindow`.
 
 ## Known limitations (it's a PoC)
 
-- **Double titlebar on GNOME apps.** We force server-side decorations
-  (`xdg-decoration`), which Qt/other GTK apps honor — but GNOME apps are
-  CSD-only and ignore it, so you get the native `NSWindow` titlebar _and_ GTK's
-  headerbar. Fix: give CSD apps a borderless `NSWindow` and handle
-  `xdg_toplevel.move`.
-- **No subsurface compositing.** `wl_subcompositor` is accepted but child
-  surfaces aren't composited, so some popovers/menus/tooltips may not show.
-- **shm only.** No DMABUF/GPU path; apps run with the cairo (software) renderer.
-- **HiDPI**: output scale is fixed at 1; no fractional scaling.
-- **No `xdg_toplevel.move/resize` initiation, or multi-output.**
+- **shm only.** No DMABUF/GPU path; apps run with the software renderer.
+- **Single-output.** The compositor advertises one virtual `wl_output`. It
+  derives scale from the max backing factor across screens and tracks the active
+  display, but there is no true multi-monitor topology.
 - **Clipboard is text-only.** See the clipboard bridge above; rich types and
   drag-and-drop are listed under [missing bridges](#missing-bridges).
 
 ## Next steps
 
-- Borderless `NSWindow` mode for CSD apps (removes the double titlebar).
-- Subsurface compositing for popovers/menus.
-- HiDPI / `wl_output` scale 2.
+- True multi-output (per-monitor `wl_output` geometry and scale).
+- GPU / DMABUF buffer path (drop the software-only renderer).
 - Fill in the [missing bridges](#missing-bridges), starting with the
   pure-Wayland ones (rich clipboard, drag-and-drop, cursor shape).
