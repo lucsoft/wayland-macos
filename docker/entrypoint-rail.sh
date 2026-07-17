@@ -72,15 +72,19 @@ done
 # connects to nothing ("failed to connect to Wayland display: Connection refused").
 rm -f "$XDG_RUNTIME_DIR/$WL_SOCK" "$XDG_RUNTIME_DIR/$WL_SOCK.lock"
 
-echo "[rail-container] starting weston rdp server on 0.0.0.0:${PORT} (${WIDTH}x${HEIGHT})"
+# Launch Microsoft's Weston fork with the RAIL shell (rdprail-shell.so) so each
+# app window is remoted individually (RemoteApp/RAIL), matching WSLg's
+#   weston --backend=rdp-backend.so --shell=rdprail-shell.so --socket=wayland-0 ...
+# TLS cert/port for the RDP backend are set on the command line (see below); if a
+# flag name differs in this fork, `weston --help` in the image lists the rdp
+# backend options.
+echo "[rail-container] starting weston rdprail server on 0.0.0.0:${PORT}"
 weston \
     --backend=rdp-backend.so \
-    --renderer=pixman \
+    --shell=rdprail-shell.so \
     --socket="$WL_SOCK" \
     --address=0.0.0.0 \
     --port="$PORT" \
-    --width="$WIDTH" \
-    --height="$HEIGHT" \
     --rdp-tls-cert="$CERT" \
     --rdp-tls-key="$KEY" &
 pids+=($!)

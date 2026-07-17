@@ -1,46 +1,89 @@
 # syntax=docker/dockerfile:1
 # RAIL back-end container (for the compositor's `--use-microsoft-rail-protocol`
-# mode). This is the WSLg-style counterpart to the waypipe image: instead of
-# forwarding the Wayland protocol, it runs **Weston as an RDP server** and
-# composites the Linux apps itself, serving them per-window (RemoteApp/RAIL) over
-# RDP. The macOS side connects with a FreeRDP RAIL client and turns each RAIL
-# window into an NSWindow.
+# mode). This is the WSLg model: Weston runs as an RDP server and remotes each
+# Linux window *individually* (RemoteApp/RAIL) rather than a whole desktop.
 #
-#   Linux app ──Wayland──> Weston (rdp-backend, in here) ──RDP/RAIL/TCP──> macOS
+#   Linux app ──Wayland──> Weston (rdprail-shell + rdp backend) ──RDP/RAIL/TCP──> macOS
 #
-# Direction note: unlike the waypipe flow (container dials OUT to the Mac), here
-# Weston is the *server* and the Mac dials IN — so the compose service publishes
-# the RDP port (3389) instead of setting MAC_HOST.
+# Per-window RAIL is NOT in upstream Weston — it lives only in Microsoft's forks
+# (the rdprail backend + rdprail-shell use server-side RAIL/VAIL APIs from
+# microsoft/FreeRDP-mirror). So this image builds both forks from source.
 #
-# Debian sid is used because it ships Weston 16 with the RDP backend
-# (libweston-16-0's rdp-backend.so, built against FreeRDP 3) — the same family of
-# component WSLg upstreamed its RAIL work into. RemoteApp/RAIL is negotiated by
-# the connecting client, so the server side just needs to run.
+# Base: Debian bullseye — the forks are from that era and build cleanly on it
+# (newer Debian breaks the older Weston/FreeRDP sources). Build recipe adapted
+# from jacobstoner.com/msweston.sh, with the RAIL shell enabled
+# (-Dshell-rdprail=true) instead of desktop mode.
+#
+# Direction note: Weston is the *server*; the Mac dials in — so the compose
+# service publishes the RDP port (3389) instead of setting MAC_HOST.
 
-FROM debian:sid
+FROM debian:bullseye
 
+# Build + runtime dependencies (superset; audio/USB codecs kept off in the build
+# flags below but their -dev packages are harmless to have present).
+# Acquire::Retries hardens against flaky bullseye (oldstable) mirror fetches.
 RUN apt-get update -qq \
- && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      weston libweston-16-0 \
-      openssl \
-      dbus dbus-x11 \
-      libgl1-mesa-dri libegl-mesa0 \
-      fonts-dejavu-core \
-      adwaita-icon-theme hicolor-icon-theme \
-      gsettings-desktop-schemas dconf-gsettings-backend \
-      gnome-calculator \
- && dbus-uuidgen --ensure=/etc/machine-id \
+ && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=8 install -y --no-install-recommends \
+      ca-certificates git meson ninja-build build-essential nasm pkg-config cmake \
+      zlib1g-dev libssl-dev \
+      libwayland-dev wayland-protocols libxkbcommon-dev libpixman-1-dev \
+      libinput-dev libdrm-dev libgbm-dev libcairo2-dev libpango1.0-dev \
+      libwebp-dev libsystemd-dev libjpeg-dev liblcms2-dev libdbus-1-dev \
+      libx11-dev libxcb1-dev libxkbfile-dev libxdamage-dev libxfixes-dev \
+      libxext-dev libxrandr-dev libxi-dev libxrender-dev libxcursor-dev \
+      libxcb-composite0-dev xwayland \
+      libgdk-pixbuf2.0-dev librsvg2-common \
+      libpam0g-dev libcolord-dev libltdl-dev \
+      openssl dbus dbus-x11 fonts-dejavu-core \
  && rm -rf /var/lib/apt/lists/*
+
+# --- Microsoft FreeRDP fork (server + RAIL/VAIL) --------------------------
+# Weston's rdprail backend links this fork's server library. Audio/USB/FFmpeg
+# channels are disabled to trim the build; the RAIL, NSC and RemoteFX codecs
+# needed for window remoting are part of FreeRDP core and always built.
+RUN git clone --depth 1 https://github.com/microsoft/FreeRDP-mirror.git /src/FreeRDP \
+ && cmake -GNinja -S /src/FreeRDP -B /src/FreeRDP/build \
+      -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release \
+      -DWITH_SERVER=ON -DWITH_CLIENT=OFF -DWITH_SAMPLE=OFF -DWITH_MANPAGES=OFF \
+      -DWITH_FFMPEG=OFF -DWITH_SWSCALE=OFF -DWITH_PULSE=OFF -DWITH_ALSA=OFF \
+      -DWITH_CUPS=OFF -DWITH_PCSC=OFF -DCHANNEL_URBDRC=OFF \
+ && ninja -C /src/FreeRDP/build \
+ && ninja -C /src/FreeRDP/build install \
+ && ldconfig \
+ && rm -rf /src/FreeRDP
+
+# EGL/GLES headers for Weston's demo clients (weston-terminal etc.). Kept in a
+# separate layer after the FreeRDP build so it stays cached. libweston itself
+# still uses the Pixman software renderer (-Drenderer-gl=false); this is only so
+# the bundled demo clients compile.
+RUN apt-get update -qq \
+ && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=8 install -y --no-install-recommends \
+      libegl1-mesa-dev libgles2-mesa-dev \
+      librsvg2-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# --- Microsoft Weston fork (rdp backend + rdprail shell) ------------------
+# -Dshell-rdprail=true is the whole point: it builds rdprail-shell.so, the
+# per-window RAIL shell. Other backends are disabled; demo clients (weston-
+# terminal) are kept as a bundled test app.
+RUN git clone --depth 1 https://github.com/microsoft/weston-mirror.git /src/weston \
+ && meson /src/weston/build /src/weston --prefix=/usr \
+      -Dbackend-default=rdp -Dbackend-rdp=true -Dshell-rdprail=true \
+      -Dbackend-drm=false -Dbackend-wayland=false -Dbackend-x11=false \
+      -Dbackend-headless=false -Dbackend-fbdev=false \
+      -Dbackend-drm-screencast-vaapi=false -Drenderer-gl=false \
+      -Dsimple-clients=shm,damage,touch,im -Dtest-junit-xml=false \
+      -Dremoting=false -Dpipewire=false -Dxwayland=true -Ddemo-clients=true \
+ && ninja -C /src/weston/build \
+ && ninja -C /src/weston/build install \
+ && ldconfig \
+ && rm -rf /src/weston
 
 COPY entrypoint-rail.sh /usr/local/bin/entrypoint-rail.sh
 RUN chmod +x /usr/local/bin/entrypoint-rail.sh
 
-# No GPU in the container: force software GL and the Pixman software renderer
-# (set on the weston command line in the entrypoint).
 ENV GDK_BACKEND=wayland \
     LIBGL_ALWAYS_SOFTWARE=1 \
-    GTK_USE_PORTAL=0 \
-    GIO_USE_PORTAL=0 \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     RDP_PORT=3389 \

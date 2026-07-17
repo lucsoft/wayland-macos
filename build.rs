@@ -22,22 +22,34 @@ fn main() {
     }
 }
 
-/// Compile csrc/rail_bridge.c and link FreeRDP 3 / WinPR, discovered via
-/// pkg-config (with FreeRDP's Homebrew keg added to PKG_CONFIG_PATH).
+/// Compile csrc/rail_bridge.c and link Microsoft's FreeRDP fork (FreeRDP 2.x,
+/// with the RAIL/VAIL server-side extensions that WSLg's Weston speaks), built
+/// and installed separately — see docs. Upstream FreeRDP 3 (Homebrew) does *not*
+/// interoperate with WSLg's RAIL stream, so the fork is required here.
+///
+/// The fork's install prefix defaults to ~/.local/msfreerdp and is overridable
+/// via the MSFREERDP_PREFIX env var.
 fn build_rail_bridge() {
     println!("cargo:rerun-if-changed=csrc/rail_bridge.c");
     println!("cargo:rerun-if-changed=csrc/rail_bridge.h");
+    println!("cargo:rerun-if-env-changed=MSFREERDP_PREFIX");
 
-    let freerdp_prefix = brew_prefix("freerdp");
-    let mut pkg_config_path = std::env::var("PKG_CONFIG_PATH").unwrap_or_default();
-    if let Some(p) = &freerdp_prefix {
-        if !pkg_config_path.is_empty() {
+    let prefix = std::env::var("MSFREERDP_PREFIX").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").expect("HOME");
+        format!("{home}/.local/msfreerdp")
+    });
+    let mut pkg_config_path = format!("{prefix}/lib/pkgconfig");
+    if let Ok(existing) = std::env::var("PKG_CONFIG_PATH") {
+        if !existing.is_empty() {
             pkg_config_path.push(':');
+            pkg_config_path.push_str(&existing);
         }
-        pkg_config_path.push_str(&format!("{p}/lib/pkgconfig"));
     }
+    // The fork's dylibs use @rpath install names; add its lib dir as an rpath so
+    // the final binary resolves them at runtime.
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{prefix}/lib");
 
-    let pkgs = ["freerdp3", "freerdp-client3", "winpr3"];
+    let pkgs = ["freerdp2", "freerdp-client2", "winpr2"];
     let pc = |flag: &str| -> Vec<String> {
         let out = Command::new("pkg-config")
             .env("PKG_CONFIG_PATH", &pkg_config_path)
@@ -45,11 +57,17 @@ fn build_rail_bridge() {
             .args(pkgs)
             .output()
             .unwrap_or_else(|e| {
-                panic!("failed to run pkg-config (is FreeRDP installed? `brew install freerdp`): {e}")
+                panic!(
+                    "failed to run pkg-config for the FreeRDP fork at {prefix} \
+                     (build microsoft/FreeRDP-mirror and install it there, or set \
+                     MSFREERDP_PREFIX): {e}"
+                )
             });
         if !out.status.success() {
             panic!(
-                "pkg-config {flag} {} failed — is FreeRDP installed? `brew install freerdp`.\n{}",
+                "pkg-config {flag} {} failed — the Microsoft FreeRDP fork isn't at \
+                 {prefix}. Build microsoft/FreeRDP-mirror (2.x, RAIL/VAIL) and install \
+                 it there, or set MSFREERDP_PREFIX.\n{}",
                 pkgs.join(" "),
                 String::from_utf8_lossy(&out.stderr)
             );
@@ -77,18 +95,5 @@ fn build_rail_bridge() {
         } else if let Some(name) = flag.strip_prefix("-l") {
             println!("cargo:rustc-link-lib={name}");
         }
-    }
-}
-
-fn brew_prefix(pkg: &str) -> Option<String> {
-    let out = Command::new("brew").args(["--prefix", pkg]).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if p.is_empty() {
-        None
-    } else {
-        Some(p)
     }
 }

@@ -104,6 +104,11 @@ mod imp {
         h: u32,
         title: *const c_char,
     ) {
+        // RAIL emits 0x0 utility/system windows (owned popups, shell helpers)
+        // that never get content; skip them so we don't spawn stray NSWindows.
+        if w == 0 || h == 0 {
+            return;
+        }
         eprintln!("[rail] window create id={id} {w}x{h} title={:?}", cstr(title));
         mac::post(WinCmd::Create {
             id,
@@ -199,10 +204,14 @@ mod imp {
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(3389);
-        // Empty program: the container already launched the app; we just attach
-        // to whatever RAIL windows it exposes. Set RAIL_APP to launch a specific
-        // RemoteApp instead.
-        let app = std::env::var("RAIL_APP").unwrap_or_default();
+        // RemoteApp program to launch via RAIL Client Execute. Must be non-empty
+        // — an empty program makes the WSLg server return an error ExecResult
+        // that FreeRDP's rail channel fails to parse (kills the session). Default
+        // matches the container's bundled app; override with RAIL_APP.
+        let app = std::env::var("RAIL_APP")
+            .ok()
+            .filter(|a| !a.is_empty())
+            .unwrap_or_else(|| "weston-terminal".to_string());
         eprintln!("[rail] connecting to {host}:{port} (RemoteApp/RAIL)");
 
         let (wake_r, wake_w) = waker_pipe();
