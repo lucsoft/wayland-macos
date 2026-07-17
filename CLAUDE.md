@@ -37,7 +37,7 @@ Linux app ──> waypipe (server, in container) ──TCP──> waypipe (clien
 | `src/wayland/*.rs` | One file per protocol family — the `Dispatch`/`GlobalDispatch` impls (see below). |
 | `src/mac.rs` | AppKit side: `WaylandView`/`WaylandWindow`/`WinDelegate`, `WinCmd` handling, drag/resize, cursors, keyboard-layout detection. |
 | `src/input.rs` | Cross-thread `InputBus`, `InputEvent`, and the shared `scale` / `output_size` atomics. |
-| `src/bridges/` | Native macOS service bridges (currently the clipboard ↔ `wl_data_device`). |
+| `src/wayland/bridges.rs`, `src/wayland/clipboard.rs` | Native macOS service bridges (currently the clipboard ↔ `wl_data_device`). |
 | `src/bin/testclient.rs` | Standalone `wayland-client` test client. |
 | `build.rs` | Points the linker at Homebrew's libxkbcommon. |
 | `docker/` | Container images + `entrypoint.sh` (see Containers). |

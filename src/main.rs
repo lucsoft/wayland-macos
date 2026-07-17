@@ -2,7 +2,6 @@
 //! native `NSWindow`. The Wayland protocol runs on a background thread; AppKit
 //! owns the main thread. See `wayland.rs` and `mac.rs`.
 
-mod bridges;
 mod input;
 mod mac;
 mod rail;

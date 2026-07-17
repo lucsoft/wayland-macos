@@ -130,7 +130,7 @@ impl Dispatch<WlCallback, ()> for State {
 // wl_data_device_manager (clipboard/DnD)
 //
 // The Dispatch/GlobalDispatch handlers for the data-device family live in the
-// clipboard bridge (`crate::bridges::clipboard`), which bridges the Wayland
+// clipboard bridge (`crate::wayland::clipboard`), which bridges the Wayland
 // selection to the macOS pasteboard. The global is still created in `run`.
 // ---------------------------------------------------------------------------
 

@@ -141,11 +141,11 @@ Linux app ──libpulse──> PULSE_SERVER (tcp) ──> PulseAudio on macOS �
 ## Bridges
 
 A **bridge** wires a Wayland facility to the equivalent native macOS service.
-`src/bridges/mod.rs` is the infra: each bridge keeps its state in a field on
+`src/wayland/bridges.rs` is the infra: each bridge keeps its state in a field on
 `Bridges` (which the compositor `State` holds as `state.bridges`) and implements
-the `Dispatch` handlers for its own protocol objects, so the glue stays out of
-`wayland.rs`. Adding one means dropping in a submodule, a field, and (if needed)
-a global in `run`.
+the `Dispatch` handlers for its own protocol objects. Adding one means dropping
+in a module under `src/wayland/`, a field on `Bridges`, and (if needed) a global
+in `run`.
 
 > **"Bridge", not "portal".** In the Linux world a _portal_
 > ([xdg-desktop-portal](https://flatpak.github.io/xdg-desktop-portal/)) is a
@@ -155,7 +155,7 @@ a global in `run`.
 
 ### Implemented
 
-- **Clipboard** — `wl_data_device` ⇆ `NSPasteboard` (`src/bridges/clipboard.rs`).
+- **Clipboard** — `wl_data_device` ⇆ `NSPasteboard` (`src/wayland/clipboard.rs`).
   Both directions route through the pasteboard, so Wayland-to-Wayland copy/paste
   works too. Plain UTF-8 text only.
   - **Copy (Wayland → macOS).** On `wl_data_device.set_selection` we ask the

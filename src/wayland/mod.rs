@@ -136,6 +136,8 @@ mod xdg_dialog;
 mod keyboard_shortcuts_inhibit;
 mod primary_selection;
 mod layer_shell;
+mod bridges;
+mod clipboard;
 
 struct PoolMem {
     fd: OwnedFd,
@@ -425,7 +427,7 @@ pub struct State {
     /// wl_surface id -> its zwlr_layer_surface object.
     surface_layer: HashMap<ObjectId, ObjectId>,
     /// Bridges to native macOS services (clipboard, ...).
-    pub(crate) bridges: crate::bridges::Bridges,
+    pub(crate) bridges: bridges::Bridges,
     /// X11-style primary (middle-click) selection, bridged client-to-client only.
     primary_selection: primary_selection::PrimarySelection,
 }
@@ -467,7 +469,7 @@ impl State {
             surface_subsurface: HashMap::new(),
             layer_surfaces: HashMap::new(),
             surface_layer: HashMap::new(),
-            bridges: crate::bridges::Bridges::new(),
+            bridges: bridges::Bridges::new(),
             primary_selection: primary_selection::PrimarySelection::default(),
         }
     }

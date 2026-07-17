@@ -19,37 +19,35 @@
 //!
 //! Each bridge, by convention:
 //!
-//! * lives in its own submodule under `bridges::`;
+//! * lives in its own module under `wayland::` (e.g. [`super::clipboard`]);
 //! * owns whatever cross-thread state it needs, exposed as a field on
 //!   [`Bridges`] (which [`crate::wayland::State`] holds as `state.bridges`) so
 //!   the Wayland `Dispatch` handlers can reach it;
 //! * implements the `Dispatch` / `GlobalDispatch` handlers for *its* protocol
-//!   objects `for State`, in its own module rather than in `wayland.rs`
+//!   objects `for State`, in its own module rather than in `mod.rs`
 //!   (Rust lets trait impls for `State` live anywhere in the crate);
 //! * marshals to and from the AppKit main thread through [`crate::mac`] and the
 //!   input bus, honoring the "AppKit only on the main thread" rule.
 //!
 //! The Wayland globals themselves are still created in [`crate::wayland::run`];
 //! a bridge only supplies the handlers and the state they hang off. To add one:
-//! create the submodule, add a field here, and (if it needs one) create its
+//! create the module, add a field here, and (if it needs one) create its
 //! global in `run`.
 //!
 //! ## Implemented
 //!
-//! * [`clipboard`] — `wl_data_device` ⇆ `NSPasteboard`.
+//! * [`super::clipboard`] — `wl_data_device` ⇆ `NSPasteboard`.
 //!
 //! Note that some existing Wayland ⇆ macOS glue predates this module and still
 //! lives elsewhere — input forwarding (`NSEvent` → `wl_pointer`/`wl_keyboard`)
 //! in `mac.rs`/`input.rs`, and window lifecycle (`xdg_toplevel` ⇆ `NSWindow`)
-//! in `wayland.rs`/`mac.rs`. They are bridges in spirit and could move here.
-
-pub mod clipboard;
+//! in `mod.rs`/`mac.rs`. They are bridges in spirit and could move here.
 
 /// Aggregate of every bridge's state, held as a single `state.bridges` field on
 /// [`crate::wayland::State`]. Grow this as bridges are added.
 #[derive(Default)]
 pub struct Bridges {
-    pub clipboard: clipboard::Clipboard,
+    pub clipboard: super::clipboard::Clipboard,
 }
 
 impl Bridges {
