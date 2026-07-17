@@ -2141,43 +2141,52 @@ fn make_cgimage(
     }
 
     // Wide-gamut / HDR path: CGImageCreate over a CFData copy of the buffer.
+    //
+    // (bits/component, bits/pixel, bitmap flags, row stride, bytes). Alpha bits go
+    // in the low 5 bits of the bitmap info (CGImageAlphaInfo). Core Graphics does
+    // NOT accept a 10-bit/32-bpp RGB image, so 10-bit content is expanded to a
+    // 16-bit RGBA image (a documented 64-bpp layout) keeping its color space.
     let color_space = cg_colorspace(space)?;
+    let (bpc, bppx, info, row_stride, owned): (usize, usize, CGBitmapInfo, usize, Vec<u8>) =
+        match format {
+            PixelFormat::Rgb2101010 => (
+                16,
+                64,
+                CGBitmapInfo::from_bits_retain(CGImageAlphaInfo::NoneSkipLast.0)
+                    | CGBitmapInfo::ByteOrder16Little,
+                (width as usize) * 8,
+                expand_2101010_to_rgba16(width, height, stride, pixels),
+            ),
+            // 64-bit four half-floats; Wayland abgr16161616f is R,G,B,A in memory
+            // (little-endian) → alpha last, 16-bit LE order, float components.
+            PixelFormat::Rgba16F => (
+                16,
+                64,
+                CGBitmapInfo::from_bits_retain(CGImageAlphaInfo::PremultipliedLast.0)
+                    | CGBitmapInfo::ByteOrder16Little
+                    | CGBitmapInfo::FloatComponents,
+                stride as usize,
+                pixels[..needed].to_vec(),
+            ),
+            // Wide-gamut 8-bit (e.g. Display P3 SDR): same packing as the SDR path.
+            PixelFormat::Bgra8888 => (
+                8,
+                32,
+                CGBitmapInfo::from_bits_retain(CGImageAlphaInfo::PremultipliedFirst.0)
+                    | CGBitmapInfo::ByteOrder32Little,
+                stride as usize,
+                pixels[..needed].to_vec(),
+            ),
+        };
+
     let data = unsafe {
         CFData::new(
             None,
-            pixels.as_ptr(),
-            needed as objc2_core_foundation::CFIndex,
+            owned.as_ptr(),
+            owned.len() as objc2_core_foundation::CFIndex,
         )
     }?;
     let provider = CGDataProvider::with_cf_data(Some(&data))?;
-
-    // (bits/component, bits/pixel, bitmap flags) for each supported layout. Alpha
-    // bits go in the low 5 bits of the bitmap info (CGImageAlphaInfo).
-    let (bpc, bppx, info) = match format {
-        // 32-bit 2:10:10:10, x/A in the top 2 bits → skip-first, 32-bit LE order.
-        PixelFormat::Rgb2101010 => (
-            10usize,
-            32usize,
-            CGBitmapInfo::from_bits_retain(CGImageAlphaInfo::NoneSkipFirst.0)
-                | CGBitmapInfo::ByteOrder32Little,
-        ),
-        // 64-bit four half-floats; Wayland abgr16161616f is R,G,B,A in memory
-        // (little-endian) → alpha last, 16-bit LE order, float components.
-        PixelFormat::Rgba16F => (
-            16usize,
-            64usize,
-            CGBitmapInfo::from_bits_retain(CGImageAlphaInfo::PremultipliedLast.0)
-                | CGBitmapInfo::ByteOrder16Little
-                | CGBitmapInfo::FloatComponents,
-        ),
-        // Wide-gamut 8-bit (e.g. Display P3 SDR): same packing as the SDR path.
-        PixelFormat::Bgra8888 => (
-            8usize,
-            32usize,
-            CGBitmapInfo::from_bits_retain(CGImageAlphaInfo::PremultipliedFirst.0)
-                | CGBitmapInfo::ByteOrder32Little,
-        ),
-    };
 
     unsafe {
         CGImage::new(
@@ -2185,7 +2194,7 @@ fn make_cgimage(
             height as usize,
             bpc,
             bppx,
-            stride as usize,
+            row_stride,
             Some(&color_space),
             info,
             Some(&provider),
@@ -2196,11 +2205,37 @@ fn make_cgimage(
     }
 }
 
+/// Expand a Wayland `argb2101010`/`xrgb2101010` buffer (32-bit LE, `A:R:G:B`
+/// 2:10:10:10) into a 16-bit-per-channel RGBA buffer (little-endian, alpha
+/// opaque). Core Graphics can't ingest 10-bit RGB directly, but 16-bit RGBA is a
+/// supported 64-bpp layout; the 10→16 bit expansion (`v<<6 | v>>4`) fills the
+/// range so the color-space tag (PQ/HLG/…) still sees the intended signal.
+fn expand_2101010_to_rgba16(width: i32, height: i32, stride: i32, pixels: &[u8]) -> Vec<u8> {
+    let (w, h, s) = (width as usize, height as usize, stride as usize);
+    let mut out = vec![0u8; w * h * 8];
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * s + x * 4;
+            let v = u32::from_le_bytes([pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]);
+            let expand = |c: u32| -> [u8; 2] { (((c << 6) | (c >> 4)) as u16).to_le_bytes() };
+            let r = expand((v >> 20) & 0x3ff);
+            let g = expand((v >> 10) & 0x3ff);
+            let b = expand(v & 0x3ff);
+            let o = (y * w + x) * 8;
+            out[o..o + 2].copy_from_slice(&r);
+            out[o + 2..o + 4].copy_from_slice(&g);
+            out[o + 4..o + 6].copy_from_slice(&b);
+            out[o + 6..o + 8].copy_from_slice(&0xffffu16.to_le_bytes());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        bytes_per_pixel, cg_space_for, csd_margin, logical_size, subsurface_origin, CgSpace,
-        ColorDesc, PixelFormat, Primaries, TransferFn,
+        bytes_per_pixel, cg_space_for, csd_margin, logical_size, make_cgimage, subsurface_origin,
+        CgSpace, ColorDesc, PixelFormat, Primaries, TransferFn,
     };
 
     fn desc(tf: TransferFn, primaries: Primaries) -> ColorDesc {
@@ -2210,6 +2245,61 @@ mod tests {
             max_luminance: None,
             ref_luminance: None,
         }
+    }
+
+    /// `make_cgimage` must actually produce a `CGImage` for every supported layout,
+    /// not just the SDR one. Core Graphics is picky about which (bits, bpp, alpha,
+    /// byte-order, color-space) combinations it accepts and returns null for the
+    /// rest — this exercises the real `CGImageCreate` headlessly (no AppKit) so a
+    /// bad HDR pixel-format spec is caught here instead of as a blank window.
+    #[test]
+    fn make_cgimage_builds_every_supported_format() {
+        // Plain SDR BGRA (the historical path).
+        let buf4 = vec![0u8; 16 * 16 * 4];
+        assert!(
+            make_cgimage(16, 16, 16 * 4, &buf4, PixelFormat::Bgra8888, None).is_some(),
+            "SDR BGRA8888"
+        );
+        // Wide-gamut SDR (Display P3, 8-bit).
+        assert!(
+            make_cgimage(
+                16,
+                16,
+                16 * 4,
+                &buf4,
+                PixelFormat::Bgra8888,
+                Some(desc(TransferFn::Srgb, Primaries::DisplayP3))
+            )
+            .is_some(),
+            "Display-P3 8-bit"
+        );
+        // 10-bit PQ (BT.2100).
+        assert!(
+            make_cgimage(
+                16,
+                16,
+                16 * 4,
+                &buf4,
+                PixelFormat::Rgb2101010,
+                Some(desc(TransferFn::Pq, Primaries::Bt2020))
+            )
+            .is_some(),
+            "10-bit PQ"
+        );
+        // float16, linear (extended-range EDR).
+        let buf8 = vec![0u8; 16 * 16 * 8];
+        assert!(
+            make_cgimage(
+                16,
+                16,
+                16 * 8,
+                &buf8,
+                PixelFormat::Rgba16F,
+                Some(desc(TransferFn::Srgb, Primaries::Bt2020))
+            )
+            .is_some(),
+            "float16 linear BT.2020"
+        );
     }
 
     /// The transfer-function / primaries → Core Graphics color space mapping that
