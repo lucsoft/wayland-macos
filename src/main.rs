@@ -41,6 +41,24 @@ fn init_logger() {
 }
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSScreen};
 
+/// Size (in points) of the bounding box that encloses every screen — the flat
+/// desktop RAIL advertises so a window can be dragged across all monitors. The
+/// origin conversion (this box's top-left ↔ each RDP offset) lives in
+/// `mac.rs`'s `WinCmd::Move`, which recomputes the same union.
+fn screen_union_size(mtm: MainThreadMarker) -> Option<(f64, f64)> {
+    let screens = NSScreen::screens(mtm);
+    let (mut min_x, mut min_y, mut max_x, mut max_y) =
+        (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for s in screens.iter() {
+        let f = s.frame();
+        min_x = min_x.min(f.origin.x);
+        min_y = min_y.min(f.origin.y);
+        max_x = max_x.max(f.origin.x + f.size.width);
+        max_y = max_y.max(f.origin.y + f.size.height);
+    }
+    (min_x.is_finite() && max_x.is_finite()).then_some((max_x - min_x, max_y - min_y))
+}
+
 fn main() {
     // Log to stderr via the `log` facade. Default level is `info`; override per
     // target with e.g. `RUST_LOG=wl=debug,mac=info`. Targets mirror the former
@@ -96,15 +114,22 @@ fn main() {
     info!(target: "wl", "display scale = {scale}");
     input::set_scale(scale);
 
-    // Advertise the real screen as the virtual output's size (physical pixels),
-    // so clients can resize windows up to the full display instead of a fixed
-    // 1920x1080 default.
-    if let Some(screen) = NSScreen::mainScreen(mtm) {
-        let frame = screen.frame();
-        input::set_output_size(
-            (frame.size.width as i32) * scale,
-            (frame.size.height as i32) * scale,
-        );
+    // Advertise the virtual output's size (physical pixels). Native Wayland is
+    // single-output: the main screen. RAIL instead spans **all** monitors as one
+    // flat desktop (the union bounding box) so windows can be dragged across
+    // displays — weston owns placement over that whole desktop and we mirror it
+    // (see WinCmd::Move). Without this weston clamps to one screen, so a window
+    // can't cross to a second monitor.
+    let out_frame = if use_rail {
+        screen_union_size(mtm)
+    } else {
+        NSScreen::mainScreen(mtm).map(|s| {
+            let f = s.frame();
+            (f.size.width, f.size.height)
+        })
+    };
+    if let Some((w, h)) = out_frame {
+        input::set_output_size((w as i32) * scale, (h as i32) * scale);
     }
 
     // Detect the macOS keyboard layout HERE, on the main thread, and cache it.

@@ -1465,15 +1465,23 @@ fn handle(cmd: WinCmd) {
             WINDOWS.with(|w| {
                 if let Some(e) = w.borrow().get(&id) {
                     // Map the RDP desktop offset (top-left origin, y down) onto the
-                    // window's screen (macOS: bottom-left origin, y up). The RAIL
-                    // desktop is single-output, so fall back to the main screen.
-                    let screen = e.window.screen().or_else(|| NSScreen::mainScreen(mtm));
-                    if let Some(screen) = screen {
-                        let sf = screen.frame();
+                    // macOS global coordinate space (bottom-left origin, y up). The
+                    // RAIL desktop spans ALL monitors (see main.rs), so convert
+                    // against the union bounding box of every screen — not the
+                    // window's current screen, which would shift the basis mid-drag
+                    // and make crossing to a second monitor jump.
+                    let screens = NSScreen::screens(mtm);
+                    let (mut min_x, mut max_top) = (f64::MAX, f64::MIN);
+                    for s in screens.iter() {
+                        let f = s.frame();
+                        min_x = min_x.min(f.origin.x);
+                        max_top = max_top.max(f.origin.y + f.size.height);
+                    }
+                    if min_x.is_finite() && max_top.is_finite() {
                         let wf = e.window.frame();
                         e.window.setFrameOrigin(CGPoint::new(
-                            sf.origin.x + x as f64,
-                            sf.origin.y + sf.size.height - y as f64 - wf.size.height,
+                            min_x + x as f64,
+                            max_top - y as f64 - wf.size.height,
                         ));
                     }
                 }
