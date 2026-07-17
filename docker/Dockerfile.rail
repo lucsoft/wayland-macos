@@ -9,19 +9,19 @@
 # (the rdprail backend + rdprail-shell use server-side RAIL/VAIL APIs from
 # microsoft/FreeRDP-mirror). So this image builds both forks from source.
 #
-# Base: Debian bullseye — the forks are from that era and build cleanly on it
-# (newer Debian breaks the older Weston/FreeRDP sources). Build recipe adapted
-# from jacobstoner.com/msweston.sh, with the RAIL shell enabled
-# (-Dshell-rdprail=true) instead of desktop mode.
+# Base: Debian sid. The forks are old (Weston 9 / FreeRDP 2.4), so sid's GCC 14
+# needs a few nudges (below) — but it builds and matches the other images' base.
 #
 # Direction note: Weston is the *server*; the Mac dials in — so the compose
 # service publishes the RDP port (3389) instead of setting MAC_HOST.
 
-FROM debian:bullseye
+FROM debian:sid
 
-# Build + runtime dependencies (superset; audio/USB codecs kept off in the build
-# flags below but their -dev packages are harmless to have present).
-# Acquire::Retries hardens against flaky bullseye (oldstable) mirror fetches.
+# GCC 14 promotes these legacy C diagnostics to hard errors by default; the
+# 2021-era Microsoft forks trip all of them. Downgrade so they build.
+ENV CFLAGS="-Wno-incompatible-pointer-types -Wno-int-conversion -Wno-implicit-function-declaration -Wno-implicit-int" \
+    CXXFLAGS="-Wno-incompatible-pointer-types"
+
 RUN apt-get update -qq \
  && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=8 install -y --no-install-recommends \
       ca-certificates git meson ninja-build build-essential nasm pkg-config cmake \
@@ -32,17 +32,17 @@ RUN apt-get update -qq \
       libx11-dev libxcb1-dev libxkbfile-dev libxdamage-dev libxfixes-dev \
       libxext-dev libxrandr-dev libxi-dev libxrender-dev libxcursor-dev \
       libxcb-composite0-dev xwayland \
-      libgdk-pixbuf2.0-dev librsvg2-common \
+      libgdk-pixbuf-2.0-dev librsvg2-common \
       libpam0g-dev libcolord-dev libltdl-dev \
       openssl dbus dbus-x11 fonts-dejavu-core \
  && rm -rf /var/lib/apt/lists/*
 
 # --- Microsoft FreeRDP fork (server + RAIL/VAIL) --------------------------
-# Weston's rdprail backend links this fork's server library. Audio/USB/FFmpeg
-# channels are disabled to trim the build; the RAIL, NSC and RemoteFX codecs
-# needed for window remoting are part of FreeRDP core and always built.
+# CMAKE_POLICY_VERSION_MINIMUM: its cmake_minimum_required predates modern CMake.
+# WITH_NEON/SSE2=OFF: the codecs' -mfpu is invalid on aarch64 with newer gcc.
 RUN git clone --depth 1 https://github.com/microsoft/FreeRDP-mirror.git /src/FreeRDP \
  && cmake -GNinja -S /src/FreeRDP -B /src/FreeRDP/build \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DWITH_NEON=OFF -DWITH_SSE2=OFF \
       -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release \
       -DWITH_SERVER=ON -DWITH_CLIENT=OFF -DWITH_SAMPLE=OFF -DWITH_MANPAGES=OFF \
       -DWITH_FFMPEG=OFF -DWITH_SWSCALE=OFF -DWITH_PULSE=OFF -DWITH_ALSA=OFF \
@@ -52,14 +52,12 @@ RUN git clone --depth 1 https://github.com/microsoft/FreeRDP-mirror.git /src/Fre
  && ldconfig \
  && rm -rf /src/FreeRDP
 
-# EGL/GLES headers for Weston's demo clients (weston-terminal etc.). Kept in a
-# separate layer after the FreeRDP build so it stays cached. libweston itself
-# still uses the Pixman software renderer (-Drenderer-gl=false); this is only so
-# the bundled demo clients compile.
+# EGL/GLES headers for Weston's demo clients (weston-terminal etc.). Separate
+# layer after the FreeRDP build so it stays cached. libweston itself uses the
+# Pixman software renderer (-Drenderer-gl=false); this is only for demo clients.
 RUN apt-get update -qq \
  && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=8 install -y --no-install-recommends \
-      libegl1-mesa-dev libgles2-mesa-dev \
-      librsvg2-dev \
+      libegl-dev libgles-dev librsvg2-dev \
  && rm -rf /var/lib/apt/lists/*
 
 # --- Microsoft Weston fork (rdp backend + rdprail shell) ------------------
