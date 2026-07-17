@@ -1,15 +1,14 @@
 name: build
 
 # Pre-builds every macOS binary the pipeline needs so users don't have to compile
-# locally:
+# locally (Apple Silicon / arm64):
 #   - wayland-macos       (the compositor)         — from this crate
 #   - testclient          (the standalone client)  — from this crate
 #   - waypipe-macos       (patched waypipe client) — pinned upstream + docker/waypipe-macos.patch
 #   - wayland-macos-rail  (RAIL/WSLg back-end)      — `--features rail`, links the
 #                          Microsoft FreeRDP 2.x fork built from source (build-rail job)
 #
-# Built for both Apple Silicon (arm64) and Intel (x86_64). On a version tag (v*)
-# the tarballs are attached to a GitHub Release.
+# On a version tag (v*) the tarballs are attached to a GitHub Release.
 
 on:
   push:
@@ -23,16 +22,8 @@ permissions:
 
 jobs:
   build:
-    name: build (${{ matrix.arch }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-14 # Apple Silicon
-            arch: arm64
-          - runner: macos-13 # Intel
-            arch: x86_64
-    runs-on: ${{ matrix.runner }}
+    name: build
+    runs-on: macos-14 # Apple Silicon
     steps:
       - uses: actions/checkout@v4
 
@@ -62,7 +53,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .waypipe-build
-          key: waypipe-${{ matrix.arch }}-${{ hashFiles('scripts/build-waypipe.sh', 'docker/waypipe-macos.patch') }}
+          key: waypipe-${{ hashFiles('scripts/build-waypipe.sh', 'docker/waypipe-macos.patch') }}
 
       - name: Build waypipe client
         run: bash scripts/build-waypipe.sh
@@ -77,13 +68,13 @@ jobs:
           ls -la "dist"
 
       - name: Package
-        run: tar -C dist -czf "wayland-macos-${{ matrix.arch }}.tar.gz" .
+        run: tar -C dist -czf "wayland-macos-arm64.tar.gz" .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wayland-macos-${{ matrix.arch }}
-          path: wayland-macos-${{ matrix.arch }}.tar.gz
+          name: wayland-macos-arm64
+          path: wayland-macos-arm64.tar.gz
           if-no-files-found: error
 
   # Optional RAIL/WSLg back-end (`--features rail`). It links Microsoft's FreeRDP
@@ -95,16 +86,8 @@ jobs:
   # (build it locally with scripts/build-msfreerdp.sh). This job pre-compiles it;
   # it is not a self-contained bundle.
   build-rail:
-    name: build rail (${{ matrix.arch }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-14 # Apple Silicon
-            arch: arm64
-          - runner: macos-13 # Intel
-            arch: x86_64
-    runs-on: ${{ matrix.runner }}
+    name: build rail
+    runs-on: macos-14 # Apple Silicon
     steps:
       - uses: actions/checkout@v4
 
@@ -129,7 +112,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.local/msfreerdp
-          key: msfreerdp-${{ matrix.arch }}-${{ hashFiles('scripts/build-msfreerdp.sh') }}
+          key: msfreerdp-${{ hashFiles('scripts/build-msfreerdp.sh') }}
 
       - name: Build MS FreeRDP fork
         if: steps.msfreerdp-cache.outputs.cache-hit != 'true'
@@ -146,17 +129,17 @@ jobs:
           ls -la "dist-rail"
 
       - name: Package
-        run: tar -C dist-rail -czf "wayland-macos-rail-${{ matrix.arch }}.tar.gz" .
+        run: tar -C dist-rail -czf "wayland-macos-rail-arm64.tar.gz" .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wayland-macos-rail-${{ matrix.arch }}
-          path: wayland-macos-rail-${{ matrix.arch }}.tar.gz
+          name: wayland-macos-rail-arm64
+          path: wayland-macos-rail-arm64.tar.gz
           if-no-files-found: error
 
-  # One Release per tag, with every arch tarball attached. Kept as a separate job
-  # so the matrix builds don't race to create the same release.
+  # One Release per tag, with every tarball attached. Kept as a separate job so
+  # the build jobs don't race to create the same release.
   release:
     name: release
     needs: [build, build-rail]
