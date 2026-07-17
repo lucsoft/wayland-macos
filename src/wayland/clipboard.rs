@@ -53,7 +53,7 @@ pub struct OfferData {
     bytes: Vec<u8>,
 }
 
-/// State of the clipboard bridge. Lives on `state.bridges.clipboard`.
+/// State of the clipboard bridge. Lives on `state.clipboard`.
 #[derive(Default)]
 pub struct Clipboard {
     /// Live client data devices; new selections are advertised to each.
@@ -258,14 +258,13 @@ impl Dispatch<WlDataDeviceManager, ()> for State {
             wl_data_device_manager::Request::CreateDataSource { id } => {
                 let source = data_init.init(id, ());
                 state
-                    .bridges
                     .clipboard
                     .source_mimes
                     .insert(source.id(), Vec::new());
             }
             wl_data_device_manager::Request::GetDataDevice { id, .. } => {
                 let device = data_init.init(id, ());
-                state.bridges.clipboard.add_device(dh, device);
+                state.clipboard.add_device(dh, device);
             }
             _ => {}
         }
@@ -285,7 +284,6 @@ impl Dispatch<WlDataSource, ()> for State {
         match request {
             wl_data_source::Request::Offer { mime_type } => {
                 state
-                    .bridges
                     .clipboard
                     .source_mimes
                     .entry(source.id())
@@ -293,7 +291,7 @@ impl Dispatch<WlDataSource, ()> for State {
                     .push(mime_type);
             }
             wl_data_source::Request::Destroy => {
-                let cb = &mut state.bridges.clipboard;
+                let cb = &mut state.clipboard;
                 cb.source_mimes.remove(&source.id());
                 if cb.active_source.as_ref() == Some(source) {
                     cb.active_source = None;
@@ -316,7 +314,7 @@ impl Dispatch<WlDataDevice, ()> for State {
     ) {
         // start_drag (DnD) and release are not handled.
         if let wl_data_device::Request::SetSelection { source, .. } = request {
-            state.bridges.clipboard.set_selection(source);
+            state.clipboard.set_selection(source);
         }
     }
 }

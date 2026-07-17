@@ -123,7 +123,7 @@ pub fn macos_keyboard_layout() -> Option<String> {
 
 // --- Clipboard bridge (NSPasteboard <-> the clipboard bridge) ---------------
 //
-// The clipboard bridge (see `bridges::clipboard`) owns the Wayland side. Here we
+// The clipboard bridge (see `wayland::clipboard`) owns the Wayland side. Here we
 // only touch `NSPasteboard`, always on the main thread:
 //
 //  * `set_clipboard` writes text the bridge pulled from a Wayland client.

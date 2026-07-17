@@ -146,7 +146,6 @@ mod xdg_dialog;
 mod keyboard_shortcuts_inhibit;
 mod primary_selection;
 mod layer_shell;
-mod bridges;
 mod clipboard;
 mod color_management;
 
@@ -483,8 +482,8 @@ pub struct State {
     layer_surfaces: HashMap<ObjectId, LayerSurfaceRec>,
     /// wl_surface id -> its zwlr_layer_surface object.
     surface_layer: HashMap<ObjectId, ObjectId>,
-    /// Bridges to native macOS services (clipboard, ...).
-    pub(crate) bridges: bridges::Bridges,
+    /// Clipboard bridge: `wl_data_device` selection ⇆ the macOS `NSPasteboard`.
+    pub(crate) clipboard: clipboard::Clipboard,
     /// X11-style primary (middle-click) selection, bridged client-to-client only.
     primary_selection: primary_selection::PrimarySelection,
     /// `wp_image_description_v1` object id -> the resolved color description it
@@ -532,7 +531,7 @@ impl State {
             surface_subsurface: HashMap::new(),
             layer_surfaces: HashMap::new(),
             surface_layer: HashMap::new(),
-            bridges: bridges::Bridges::new(),
+            clipboard: clipboard::Clipboard::default(),
             primary_selection: primary_selection::PrimarySelection::default(),
             image_descs: HashMap::new(),
             param_creators: HashMap::new(),
@@ -1200,7 +1199,7 @@ impl State {
                 // safe to advertise the macOS clipboard selection to it.
                 if focused {
                     if let Some(client) = surface.client() {
-                        self.bridges.clipboard.advertise_to_client(dh, &client);
+                        self.clipboard.advertise_to_client(dh, &client);
                     }
                 }
             }
@@ -1494,7 +1493,7 @@ pub fn run(bus: Arc<InputBus>) {
                     // The macOS pasteboard changed: let the clipboard bridge
                     // re-advertise it to Wayland clients.
                     InputEvent::MacClipboard { text } => {
-                        state.bridges.clipboard.set_mac_selection(&dh, text);
+                        state.clipboard.set_mac_selection(&dh, text);
                     }
                     other => state.process_input(&dh, other),
                 }
@@ -1516,7 +1515,7 @@ pub fn run(bus: Arc<InputBus>) {
         }
         // The flush transmitted any clipboard `send` fds; drop our write ends so
         // the reader threads see EOF. Same for the primary selection.
-        state.bridges.clipboard.flush_done();
+        state.clipboard.flush_done();
         state.primary_selection.flush_done();
     }
 }

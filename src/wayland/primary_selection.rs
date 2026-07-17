@@ -4,7 +4,7 @@
 //! it, a middle-click pastes it. Many Linux apps rely on it. macOS has no
 //! equivalent, so this is a purely client-to-client bridge — the selection is
 //! offered among Wayland clients and never touches the macOS pasteboard (that is
-//! what `src/bridges/clipboard.rs` does for the regular `wl_data_device`).
+//! what `src/wayland/clipboard.rs` does for the regular `wl_data_device`).
 //!
 //! The flow mirrors the clipboard bridge: a client offers a `..._source_v1` and
 //! makes it the selection with `set_selection`; we advertise a fresh

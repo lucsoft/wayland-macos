@@ -141,11 +141,10 @@ Linux app ──libpulse──> PULSE_SERVER (tcp) ──> PulseAudio on macOS �
 ## Bridges
 
 A **bridge** wires a Wayland facility to the equivalent native macOS service.
-`src/wayland/bridges.rs` is the infra: each bridge keeps its state in a field on
-`Bridges` (which the compositor `State` holds as `state.bridges`) and implements
-the `Dispatch` handlers for its own protocol objects. Adding one means dropping
-in a module under `src/wayland/`, a field on `Bridges`, and (if needed) a global
-in `run`.
+Each bridge lives in its own module under `src/wayland/`, keeps its state in a
+field on the compositor `State` (e.g. `state.clipboard`), and implements the
+`Dispatch` handlers for its own protocol objects. Adding one means dropping in a
+module, a `State` field, and (if needed) a global in `run`.
 
 > **"Bridge", not "portal".** In the Linux world a _portal_
 > ([xdg-desktop-portal](https://flatpak.github.io/xdg-desktop-portal/)) is a
