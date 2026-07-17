@@ -22,6 +22,14 @@ impl GlobalDispatch<WlShm, ()> for State {
         let shm = data_init.init(resource, ());
         shm.format(wl_shm::Format::Argb8888);
         shm.format(wl_shm::Format::Xrgb8888);
+        // HDR / wide-gamut formats. A color-managed client (see color_management.rs)
+        // renders 10-bit or float16 content into shm and tags the surface with a
+        // PQ/HLG image description; `buffer_to_pixels`/`make_cgimage` decode these
+        // without truncating to 8-bit. Only the layouts whose byte order maps
+        // cleanly to a Core Graphics image are advertised (see `shm_pixel_format`).
+        shm.format(wl_shm::Format::Xrgb2101010);
+        shm.format(wl_shm::Format::Argb2101010);
+        shm.format(wl_shm::Format::Abgr16161616f);
     }
 }
 

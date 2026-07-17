@@ -85,7 +85,16 @@ use wayland_protocols_wlr::layer_shell::v1::server::{
 };
 
 use crate::input::{InputBus, InputEvent};
-use crate::mac::{self, WinCmd};
+use crate::mac::{self, ColorDesc, PixelFormat, Primaries, TransferFn, WinCmd};
+use wayland_protocols::wp::color_management::v1::server::{
+    wp_color_management_output_v1::WpColorManagementOutputV1,
+    wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1,
+    wp_color_management_surface_v1::WpColorManagementSurfaceV1,
+    wp_color_manager_v1::WpColorManagerV1,
+    wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1,
+    wp_image_description_info_v1::WpImageDescriptionInfoV1,
+    wp_image_description_v1::WpImageDescriptionV1,
+};
 
 const COMPOSITOR_VERSION: u32 = 6;
 const SHM_VERSION: u32 = 1;
@@ -108,6 +117,7 @@ const XDG_DIALOG_VERSION: u32 = 1;
 const KEYBOARD_SHORTCUTS_INHIBIT_VERSION: u32 = 1;
 const PRIMARY_SELECTION_VERSION: u32 = 1;
 const LAYER_SHELL_VERSION: u32 = 4;
+const COLOR_MANAGEMENT_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Shared memory
@@ -138,6 +148,7 @@ mod primary_selection;
 mod layer_shell;
 mod bridges;
 mod clipboard;
+mod color_management;
 
 struct PoolMem {
     fd: OwnedFd,
@@ -183,10 +194,35 @@ fn monotonic_now() -> (u64, u32) {
     (ts.tv_sec as u64, ts.tv_nsec as u32)
 }
 
-/// Copy a `wl_buffer`'s contents out to raw BGRA pixels (physical px), returning
-/// `(width, height, stride, pixels)`. Used for both window presentation and
-/// cursor surfaces.
-fn buffer_to_pixels(buffer: &WlBuffer) -> Option<(i32, i32, i32, Vec<u8>)> {
+/// Raw pixels copied out of a `wl_buffer` (physical px), tagged with their memory
+/// layout so the AppKit side can build a matching `CGImage` without a lossy
+/// conversion. Used for both window presentation and cursor surfaces.
+struct PixelBuf {
+    width: i32,
+    height: i32,
+    stride: i32,
+    format: PixelFormat,
+    bytes: Vec<u8>,
+}
+
+/// Map a `wl_shm` format code to the `PixelFormat` the AppKit side understands
+/// and its bytes-per-pixel. Formats we don't specifically recognise are treated
+/// as ordinary 8-bit BGRA (4 bytes) — the historical behaviour.
+fn shm_pixel_format(format: u32) -> (PixelFormat, usize) {
+    // Compare against the `wl_shm::Format` fourcc values (cast is a const expr).
+    const XRGB2101010: u32 = wl_shm::Format::Xrgb2101010 as u32;
+    const ARGB2101010: u32 = wl_shm::Format::Argb2101010 as u32;
+    const ABGR16161616F: u32 = wl_shm::Format::Abgr16161616f as u32;
+    match format {
+        XRGB2101010 | ARGB2101010 => (PixelFormat::Rgb2101010, 4),
+        ABGR16161616F => (PixelFormat::Rgba16F, 8),
+        _ => (PixelFormat::Bgra8888, 4),
+    }
+}
+
+/// Copy a `wl_buffer`'s contents out to raw pixels (physical px). Used for both
+/// window presentation and cursor surfaces.
+fn buffer_to_pixels(buffer: &WlBuffer) -> Option<PixelBuf> {
     let bd = buffer.data::<BufferData>()?;
     match &bd.kind {
         BufferKind::Shm {
@@ -195,36 +231,49 @@ fn buffer_to_pixels(buffer: &WlBuffer) -> Option<(i32, i32, i32, Vec<u8>)> {
             width,
             height,
             stride,
-            ..
+            format,
         } => {
             // Reject anything that could index outside the pool. Every step uses
             // checked arithmetic on `usize`: a client controls all of these fields,
             // and an unchecked `offset as usize` (a negative offset becomes ~1.8e19)
-            // or an `i32` multiply (`width * 4`, `stride * height`) would slip past
+            // or an `i32` multiply (`width * bpp`, `stride * height`) would slip past
             // the bounds check and panic the slice below — taking the whole
             // compositor, and every window, down. See `shm_buffer_*` tests.
             if *width <= 0 || *height <= 0 || *offset < 0 || *stride < 0 {
                 return None;
             }
+            let (pf, bpp) = shm_pixel_format(*format);
             let w = *width as usize;
             let h = *height as usize;
             let off = *offset as usize;
             let strd = *stride as usize;
-            if strd < w.checked_mul(4)? {
+            if strd < w.checked_mul(bpp)? {
                 return None;
             }
             let len = strd.checked_mul(h)?;
             let end = off.checked_add(len)?;
-            let mut pixels = vec![0u8; len];
+            let mut bytes = vec![0u8; len];
             let guard = pool.map.read().unwrap_or_else(|e| e.into_inner());
             let map = guard.as_ref()?;
             if end > map.len() {
                 return None;
             }
-            pixels.copy_from_slice(&map[off..end]);
-            Some((*width, *height, *stride, pixels))
+            bytes.copy_from_slice(&map[off..end]);
+            Some(PixelBuf {
+                width: *width,
+                height: *height,
+                stride: *stride,
+                format: pf,
+                bytes,
+            })
         }
-        BufferKind::SinglePixel { bgra } => Some((1, 1, 4, bgra.to_vec())),
+        BufferKind::SinglePixel { bgra } => Some(PixelBuf {
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: PixelFormat::Bgra8888,
+            bytes: bgra.to_vec(),
+        }),
     }
 }
 
@@ -241,7 +290,8 @@ enum BufferKind {
         width: i32,
         height: i32,
         stride: i32,
-        #[allow(dead_code)]
+        /// The `wl_shm` format fourcc; selects the `PixelFormat` (8-bit vs 10-bit
+        /// vs float16) the frame is decoded as (see `shm_pixel_format`).
         format: u32,
     },
     /// A 1x1 solid-colour buffer (`wp_single_pixel_buffer`). Stored as one BGRA
@@ -272,6 +322,13 @@ struct SurfaceRec {
     /// buffer and declares the real output size this way, so the window must
     /// follow the destination, not the buffer.
     viewport_dst: Option<(i32, i32)>,
+    /// `wp_color_management_surface_v1.set_image_description`: the color
+    /// characteristics staged for the next commit. `Some(desc)` sets it,
+    /// `Some(None)` unsets it, `None` means unchanged this cycle.
+    pending_color: Option<Option<ColorDesc>>,
+    /// The color description currently in effect (double-buffered from
+    /// `pending_color` on commit). `None` = ordinary sRGB SDR.
+    color: Option<ColorDesc>,
 }
 
 struct ToplevelRec {
@@ -430,6 +487,12 @@ pub struct State {
     pub(crate) bridges: bridges::Bridges,
     /// X11-style primary (middle-click) selection, bridged client-to-client only.
     primary_selection: primary_selection::PrimarySelection,
+    /// `wp_image_description_v1` object id -> the resolved color description it
+    /// represents. A surface references one of these via `set_image_description`.
+    image_descs: HashMap<ObjectId, ColorDesc>,
+    /// In-flight `wp_image_description_creator_params_v1` accumulators, keyed by
+    /// the creator object id; consumed when the client calls `create`.
+    param_creators: HashMap<ObjectId, color_management::ParamAccum>,
 }
 
 impl State {
@@ -471,6 +534,8 @@ impl State {
             surface_layer: HashMap::new(),
             bridges: bridges::Bridges::new(),
             primary_selection: primary_selection::PrimarySelection::default(),
+            image_descs: HashMap::new(),
+            param_creators: HashMap::new(),
         }
     }
 
@@ -524,15 +589,15 @@ impl State {
             .get_mut(sid)
             .and_then(|r| r.pending_buffer.take());
         if let Some(buffer) = buffer {
-            if let Some((w, h, stride, pixels)) = buffer_to_pixels(&buffer) {
+            if let Some(pb) = buffer_to_pixels(&buffer) {
                 let (hx, hy) = self.cursor_hotspot;
                 mac::post(WinCmd::SetCursorImage {
-                    width: w,
-                    height: h,
-                    stride,
+                    width: pb.width,
+                    height: pb.height,
+                    stride: pb.stride,
                     hotspot_x: hx,
                     hotspot_y: hy,
-                    pixels,
+                    pixels: pb.bytes,
                 });
             }
             buffer.release();
@@ -546,6 +611,13 @@ impl State {
             .surfaces
             .get_mut(&sid)
             .and_then(|r| r.pending_buffer.take());
+
+        // Apply any staged color description (double-buffered, like the buffer).
+        if let Some(rec) = self.surfaces.get_mut(&sid) {
+            if let Some(new_color) = rec.pending_color.take() {
+                rec.color = new_color;
+            }
+        }
 
         // xdg_shell handshake: the first commit (typically with no buffer) must be
         // answered with a configure before the client will attach content.
@@ -628,15 +700,15 @@ impl State {
             if self.cursor_surface.as_ref() == Some(&sid) {
                 // This surface is the pointer cursor: turn its buffer into a
                 // native cursor image instead of a window.
-                if let Some((w, h, stride, pixels)) = buffer_to_pixels(&buffer) {
+                if let Some(pb) = buffer_to_pixels(&buffer) {
                     let (hx, hy) = self.cursor_hotspot;
                     mac::post(WinCmd::SetCursorImage {
-                        width: w,
-                        height: h,
-                        stride,
+                        width: pb.width,
+                        height: pb.height,
+                        stride: pb.stride,
                         hotspot_x: hx,
                         hotspot_y: hy,
-                        pixels,
+                        pixels: pb.bytes,
                     });
                 }
             } else if self.surface_subsurface.contains_key(&sid) {
@@ -699,10 +771,14 @@ impl State {
     }
 
     fn present(&mut self, sid: &ObjectId, buffer: &WlBuffer) {
-        // Resolve the frame to raw BGRA pixels regardless of buffer kind.
-        let Some((width, height, stride, pixels)) = buffer_to_pixels(buffer) else {
+        // Resolve the frame to raw pixels (+layout) regardless of buffer kind.
+        let Some(pb) = buffer_to_pixels(buffer) else {
             return;
         };
+        let (width, height, stride, format, pixels) =
+            (pb.width, pb.height, pb.stride, pb.format, pb.bytes);
+        // The surface's negotiated color characteristics (HDR/wide-gamut), if any.
+        let color = self.surfaces.get(sid).and_then(|s| s.color);
 
         // Logical (point) size: a `wp_viewport` destination if the client set one,
         // else (0, 0) — AppKit then derives the size from the buffer pixels and the
@@ -752,6 +828,8 @@ impl State {
                 dst_w,
                 dst_h,
                 pixels,
+                format,
+                color,
                 geom,
             });
             return;
@@ -798,6 +876,8 @@ impl State {
                 dst_w,
                 dst_h,
                 pixels,
+                format,
+                color,
                 geom: (0, 0, 0, 0),
             });
         }
@@ -850,9 +930,12 @@ impl State {
         let Some(ls_id) = self.surface_layer.get(sid).cloned() else {
             return;
         };
-        let Some((width, height, stride, pixels)) = buffer_to_pixels(buffer) else {
+        let Some(pb) = buffer_to_pixels(buffer) else {
             return;
         };
+        let (width, height, stride, format, pixels) =
+            (pb.width, pb.height, pb.stride, pb.format, pb.bytes);
+        let color = self.surfaces.get(sid).and_then(|s| s.color);
         let (window_id, anchor, margin, created, kbd, surface) = {
             let l = &self.layer_surfaces[&ls_id];
             (
@@ -900,6 +983,8 @@ impl State {
             dst_w: 0,
             dst_h: 0,
             pixels,
+            format,
+            color,
             geom: (0, 0, 0, 0),
         });
     }
@@ -954,9 +1039,12 @@ impl State {
         let Some((window_id, ox, oy, sub_id)) = self.resolve_subsurface(sid) else {
             return;
         };
-        let Some((width, height, stride, pixels)) = buffer_to_pixels(buffer) else {
+        let Some(pb) = buffer_to_pixels(buffer) else {
             return;
         };
+        let (width, height, stride, format, pixels) =
+            (pb.width, pb.height, pb.stride, pb.format, pb.bytes);
+        let color = self.surfaces.get(sid).and_then(|s| s.color);
         let (dst_w, dst_h) = self
             .surfaces
             .get(sid)
@@ -973,6 +1061,8 @@ impl State {
             dst_w,
             dst_h,
             pixels,
+            format,
+            color,
         });
     }
 
@@ -1322,6 +1412,7 @@ pub fn run(bus: Arc<InputBus>) {
     );
     dh.create_global::<State, ZwpPrimarySelectionDeviceManagerV1, _>(PRIMARY_SELECTION_VERSION, ());
     dh.create_global::<State, ZwlrLayerShellV1, _>(LAYER_SHELL_VERSION, ());
+    dh.create_global::<State, WpColorManagerV1, _>(COLOR_MANAGEMENT_VERSION, ());
 
     let socket = ListeningSocket::bind_auto("wayland", 1..32).expect("bind wayland socket");
     let name = socket
@@ -1491,6 +1582,7 @@ fn register_test_globals(dh: &DisplayHandle) {
     );
     dh.create_global::<State, ZwpPrimarySelectionDeviceManagerV1, _>(PRIMARY_SELECTION_VERSION, ());
     dh.create_global::<State, ZwlrLayerShellV1, _>(LAYER_SHELL_VERSION, ());
+    dh.create_global::<State, WpColorManagerV1, _>(COLOR_MANAGEMENT_VERSION, ());
 }
 
 #[cfg(test)]
@@ -1558,6 +1650,30 @@ mod tests {
         p.offset = (5, 7);
         assert_eq!(p.popup_origin(), (55, -43), "offset shifts the origin");
     }
+
+    /// `wl_shm` format codes map to the right `PixelFormat` + bytes-per-pixel:
+    /// 8-bit BGRA (the default), 10-bit (4 bytes), float16 (8 bytes).
+    #[test]
+    fn shm_format_maps_to_pixel_format() {
+        assert_eq!(
+            shm_pixel_format(wl_shm::Format::Xrgb8888 as u32),
+            (PixelFormat::Bgra8888, 4)
+        );
+        assert_eq!(
+            shm_pixel_format(wl_shm::Format::Xrgb2101010 as u32),
+            (PixelFormat::Rgb2101010, 4)
+        );
+        assert_eq!(
+            shm_pixel_format(wl_shm::Format::Argb2101010 as u32),
+            (PixelFormat::Rgb2101010, 4)
+        );
+        assert_eq!(
+            shm_pixel_format(wl_shm::Format::Abgr16161616f as u32),
+            (PixelFormat::Rgba16F, 8)
+        );
+        // An unrecognised format falls back to 8-bit BGRA (historical behaviour).
+        assert_eq!(shm_pixel_format(0xDEAD_BEEF), (PixelFormat::Bgra8888, 4));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1613,6 +1729,12 @@ mod harness_tests {
         xdg_activation_token_v1::{self, XdgActivationTokenV1},
         xdg_activation_v1::XdgActivationV1,
     };
+    use wayland_protocols::wp::color_management::v1::client::{
+        wp_color_management_surface_v1::WpColorManagementSurfaceV1,
+        wp_color_manager_v1::{Primaries as CmPrimaries, RenderIntent, TransferFunction, WpColorManagerV1},
+        wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1,
+        wp_image_description_v1::{self, WpImageDescriptionV1},
+    };
 
     /// Serializes harness tests: `mac::post`'s sink is process-global, and cargo
     /// runs tests in parallel, so two harnesses must not share the channel.
@@ -1641,6 +1763,9 @@ mod harness_tests {
         activation_token: Option<String>,
         /// `(width, height)` of every `xdg_toplevel.configure` the client received.
         toplevel_configures: Vec<(i32, i32)>,
+        /// Set when a `wp_image_description_v1.ready` event arrives (the color
+        /// description the client built was accepted by the compositor).
+        image_desc_ready: bool,
     }
 
     /// The bound client proxies plus its connection/queue/state.
@@ -1869,6 +1994,33 @@ mod harness_tests {
             let pool: WlShmPool = c.shm.create_pool(file.as_fd(), file_size, &c.qh, ());
             let buffer =
                 pool.create_buffer(0, w, h, stride, wl_shm::Format::Xrgb8888, &c.qh, ());
+            self.keep_files.push(file);
+            buffer
+        }
+
+        /// Make a 10-bit `argb2101010` shm buffer (4 bytes/pixel), as an HDR client
+        /// would when it renders PQ content. The bytes are zeroed — the test only
+        /// asserts on the format/color the compositor forwards, not the pixels.
+        fn shm_buffer_10bit(&mut self, w: i32, h: i32) -> WlBuffer {
+            let stride = w * 4;
+            let file_size = (stride * h).max(1);
+            let seq = FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let mut path = std::env::temp_dir();
+            path.push(format!("wlmac-harness-10bit-{}-{}", std::process::id(), seq));
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .expect("open shm file");
+            let _ = std::fs::remove_file(&path); // unlink; the fd stays valid
+            file.set_len(file_size as u64).expect("set_len");
+
+            let c = self.client.as_mut().expect("client still connected");
+            let pool: WlShmPool = c.shm.create_pool(file.as_fd(), file_size, &c.qh, ());
+            let buffer =
+                pool.create_buffer(0, w, h, stride, wl_shm::Format::Argb2101010, &c.qh, ());
             self.keep_files.push(file);
             buffer
         }
@@ -2578,6 +2730,25 @@ mod harness_tests {
     wayland_client::delegate_noop!(CState: ignore WpViewport);
     wayland_client::delegate_noop!(CState: ignore WpSinglePixelBufferManagerV1);
     wayland_client::delegate_noop!(CState: ignore XdgActivationV1);
+    wayland_client::delegate_noop!(CState: ignore WpColorManagerV1);
+    wayland_client::delegate_noop!(CState: ignore WpImageDescriptionCreatorParamsV1);
+    wayland_client::delegate_noop!(CState: ignore WpColorManagementSurfaceV1);
+
+    /// Records that the compositor marked the client's image description ready.
+    impl Dispatch<WpImageDescriptionV1, ()> for CState {
+        fn event(
+            state: &mut Self,
+            _: &WpImageDescriptionV1,
+            event: wp_image_description_v1::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let wp_image_description_v1::Event::Ready { .. } = event {
+                state.image_desc_ready = true;
+            }
+        }
+    }
 
     /// Records the token string the compositor echoes back on `commit`.
     impl Dispatch<XdgActivationTokenV1, ()> for CState {
@@ -2668,5 +2839,97 @@ mod harness_tests {
             .iter()
             .any(|c| matches!(c, WinCmd::Activate { id } if *id == window_id));
         assert!(activated, "expected WinCmd::Activate for window {window_id}");
+    }
+
+    // === HDR / color management ========================================
+
+    /// The color-management global is advertised, and the wl_shm formats now
+    /// include the HDR / wide-gamut layouts.
+    #[test]
+    fn advertises_color_management_and_hdr_shm_formats() {
+        let mut h = Harness::new();
+        h.pump();
+        let advertised: Vec<String> =
+            h.client().cstate.globals.iter().map(|g| g.1.clone()).collect();
+        assert!(
+            advertised.iter().any(|g| g == "wp_color_manager_v1"),
+            "wp_color_manager_v1 not advertised; got {advertised:?}"
+        );
+        let formats = &h.client().cstate.shm_formats;
+        for f in [
+            wl_shm::Format::Xrgb2101010 as u32,
+            wl_shm::Format::Argb2101010 as u32,
+            wl_shm::Format::Abgr16161616f as u32,
+        ] {
+            assert!(formats.contains(&f), "shm format {f:#x} not advertised");
+        }
+    }
+
+    /// End-to-end HDR path: build a PQ + BT.2020 parametric image description, set
+    /// it on a toplevel's surface, commit a 10-bit `argb2101010` buffer, and assert
+    /// the `WinCmd::Frame` handed to AppKit carries the 10-bit format and the HDR
+    /// color description (so `make_cgimage` tags a PQ color space and EDR is armed).
+    #[test]
+    fn hdr_image_description_reaches_frame() {
+        let mut h = Harness::new();
+        let (surface, _xdg, _tl) = h.make_toplevel();
+
+        // Bind the color manager from a fresh registry on the live connection.
+        let manager: WpColorManagerV1 = {
+            let c = h.client();
+            let (name, ver) = c
+                .cstate
+                .globals
+                .iter()
+                .find(|g| g.1 == "wp_color_manager_v1")
+                .map(|g| (g.0, g.2))
+                .expect("color manager advertised");
+            let registry = c._conn.display().get_registry(&c.qh, ());
+            registry.bind(name, ver, &c.qh, ())
+        };
+
+        // Build a PQ + BT.2020 image description via the parametric creator.
+        let qh = h.client().qh.clone();
+        let img: WpImageDescriptionV1 = {
+            let creator: WpImageDescriptionCreatorParamsV1 =
+                manager.create_parametric_creator(&qh, ());
+            creator.set_tf_named(TransferFunction::St2084Pq);
+            creator.set_primaries_named(CmPrimaries::Bt2020);
+            creator.create(&qh, ())
+        };
+        h.pump();
+        assert!(
+            h.client().cstate.image_desc_ready,
+            "compositor marked the PQ/BT.2020 description ready"
+        );
+
+        // Attach it to the surface and commit a 10-bit buffer.
+        let cm_surface: WpColorManagementSurfaceV1 = manager.get_surface(&surface, &qh, ());
+        cm_surface.set_image_description(&img, RenderIntent::Perceptual);
+        let buf = h.shm_buffer_10bit(16, 16);
+        surface.attach(Some(&buf), 0, 0);
+        surface.commit();
+        h.pump();
+
+        let cmds = h.cmds();
+        let (format, color) = cmds
+            .iter()
+            .find_map(|c| match c {
+                WinCmd::Frame { format, color, .. } => Some((*format, *color)),
+                _ => None,
+            })
+            .expect("a Frame was emitted for the HDR buffer");
+        assert_eq!(
+            format,
+            crate::mac::PixelFormat::Rgb2101010,
+            "the 10-bit buffer is forwarded as a 10-bit frame (not truncated)"
+        );
+        let color = color.expect("the frame carries a color description");
+        assert_eq!(color.tf, crate::mac::TransferFn::Pq, "PQ transfer preserved");
+        assert_eq!(
+            color.primaries,
+            crate::mac::Primaries::Bt2020,
+            "BT.2020 primaries preserved"
+        );
     }
 }

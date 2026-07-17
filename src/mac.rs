@@ -7,7 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::ptr::{copy_nonoverlapping, null_mut};
+use std::ptr::{copy_nonoverlapping, null, null_mut};
 use std::sync::Arc;
 
 use std::time::Duration;
@@ -23,11 +23,14 @@ use objc2_app_kit::{
     NSView, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate, NSWindowOrderingMode,
     NSWindowStyleMask,
 };
-use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{CFData, CGPoint, CGRect, CGSize};
 use objc2_quartz_core::{CALayer, CATransaction};
 use objc2_core_graphics::{
-    CGBitmapContextCreate, CGBitmapContextCreateImage, CGBitmapContextGetData, CGColorSpace,
-    CGImage, CGImageAlphaInfo, CGImageByteOrderInfo,
+    kCGColorSpaceDisplayP3, kCGColorSpaceExtendedLinearDisplayP3,
+    kCGColorSpaceExtendedLinearITUR_2020, kCGColorSpaceITUR_2100_HLG, kCGColorSpaceITUR_2100_PQ,
+    CGBitmapContextCreate, CGBitmapContextCreateImage, CGBitmapContextGetData, CGBitmapInfo,
+    CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage, CGImageAlphaInfo,
+    CGImageByteOrderInfo,
 };
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSString};
 
@@ -747,6 +750,60 @@ impl WinDelegate {
     }
 }
 
+/// Transfer function (electro-optical curve) of a surface's content, from the
+/// color-management protocol. `Pq`/`Hlg` are the HDR curves that light up the
+/// display's Extended Dynamic Range headroom; `Srgb` is ordinary SDR.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum TransferFn {
+    Srgb,
+    Pq,
+    Hlg,
+}
+
+/// Color primaries (gamut) of a surface's content.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Primaries {
+    Srgb,
+    DisplayP3,
+    Bt2020,
+}
+
+/// A surface's color characteristics, negotiated via `wp_color_manager_v1`.
+/// Built on the Wayland side (see `color_management.rs`) and carried to the
+/// AppKit side so `make_cgimage` can pick a matching `CGColorSpace` and the
+/// layer can opt into EDR.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ColorDesc {
+    pub tf: TransferFn,
+    pub primaries: Primaries,
+    /// Maximum mastering/target luminance in cd/m² (nits), if the client set it.
+    /// Captured for completeness; not used for tone-mapping (the OS composites).
+    pub max_luminance: Option<f32>,
+    /// Reference (SDR) white luminance in cd/m², if the client set it.
+    pub ref_luminance: Option<f32>,
+}
+
+impl ColorDesc {
+    /// True when this content needs HDR/EDR output (a PQ or HLG transfer curve).
+    pub fn is_hdr(&self) -> bool {
+        matches!(self.tf, TransferFn::Pq | TransferFn::Hlg)
+    }
+
+}
+
+/// Memory layout of the raw pixels in a `WinCmd::Frame`/`SubFrame`, so the AppKit
+/// side interprets them without a lossy 8-bit conversion. Mirrors the shm formats
+/// accepted in `shm.rs` (see `buffer_to_pixels`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PixelFormat {
+    /// 32-bit, byte order B,G,R,X/A (Wayland XRGB8888/ARGB8888 little-endian).
+    Bgra8888,
+    /// 32-bit, 2:10:10:10 packed (Wayland xRGB2101010 & friends, little-endian).
+    Rgb2101010,
+    /// 64-bit, four 16-bit floats per pixel (Wayland xRGB16161616F & friends).
+    Rgba16F,
+}
+
 /// A command sent from the Wayland thread to the AppKit main thread.
 pub enum WinCmd {
     /// Create a native window for a Wayland toplevel.
@@ -776,8 +833,13 @@ pub enum WinCmd {
         /// derive it from the buffer pixels and the output scale.
         dst_w: i32,
         dst_h: i32,
-        /// Raw pixels, 32-bit, byte order B,G,R,X (Wayland XRGB8888/ARGB8888 LE).
+        /// Raw pixels in `format`'s layout (BGRA8888 by default; 10-bit / f16 for HDR).
         pixels: Vec<u8>,
+        /// Memory layout of `pixels`.
+        format: PixelFormat,
+        /// The surface's negotiated color characteristics, if any (HDR/wide-gamut).
+        /// `None` = ordinary sRGB SDR.
+        color: Option<ColorDesc>,
         /// CSD window geometry `(x, y, w, h)` in logical points (see Create). When
         /// set, the window is sized to `(w,h)` and the buffer is cropped to the
         /// content, so a shadow-padded buffer doesn't grow the window each resize.
@@ -828,6 +890,10 @@ pub enum WinCmd {
         dst_w: i32,
         dst_h: i32,
         pixels: Vec<u8>,
+        /// Memory layout of `pixels`.
+        format: PixelFormat,
+        /// The subsurface's negotiated color characteristics, if any.
+        color: Option<ColorDesc>,
     },
     /// Remove a subsurface's sublayer.
     SubDestroy { window_id: u32, sub_id: u32 },
@@ -1040,7 +1106,8 @@ fn make_cursor(
     hotspot_y: i32,
     pixels: &[u8],
 ) -> Option<Retained<NSCursor>> {
-    let image = make_cgimage(width, height, stride, pixels)?;
+    // Cursor buffers are always ordinary 8-bit BGRA (SDR).
+    let image = make_cgimage(width, height, stride, pixels, PixelFormat::Bgra8888, None)?;
     let scale = crate::input::scale() as f64;
     let size = CGSize::new(width as f64 / scale, height as f64 / scale);
     let ns_image = NSImage::initWithCGImage_size(mtm.alloc::<NSImage>(), &image, size);
@@ -1180,8 +1247,12 @@ fn handle(cmd: WinCmd) {
             dst_w,
             dst_h,
             pixels,
+            format,
+            color,
             geom,
-        } => present_frame(mtm, id, width, height, stride, dst_w, dst_h, &pixels, geom),
+        } => present_frame(
+            mtm, id, width, height, stride, dst_w, dst_h, &pixels, format, color, geom,
+        ),
         WinCmd::Title { id, title } => {
             WINDOWS.with(|w| {
                 if let Some(e) = w.borrow().get(&id) {
@@ -1257,8 +1328,10 @@ fn handle(cmd: WinCmd) {
             dst_w,
             dst_h,
             pixels,
+            format,
+            color,
         } => present_subframe(
-            window_id, sub_id, x, y, width, height, stride, dst_w, dst_h, &pixels,
+            window_id, sub_id, x, y, width, height, stride, dst_w, dst_h, &pixels, format, color,
         ),
         WinCmd::SubDestroy { window_id, sub_id } => {
             WINDOWS.with(|w| {
@@ -1756,6 +1829,7 @@ fn create_popup(
     eprintln!("[mac] created popup {id} under {parent_id} at ({x},{y}) {width}x{height}");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn present_frame(
     mtm: MainThreadMarker,
     id: u32,
@@ -1765,9 +1839,11 @@ fn present_frame(
     dst_w: i32,
     dst_h: i32,
     pixels: &[u8],
+    format: PixelFormat,
+    color: Option<ColorDesc>,
     geom: (i32, i32, i32, i32),
 ) {
-    let Some(image) = make_cgimage(width, height, stride, pixels) else {
+    let Some(image) = make_cgimage(width, height, stride, pixels, format, color) else {
         eprintln!("[mac] failed to build CGImage for {id}");
         return;
     };
@@ -1830,6 +1906,9 @@ fn present_frame(
         let _ = mtm;
 
         if let Some(layer) = entry.view.layer() {
+            // Opt the layer into EDR when the content is HDR, so highlights above
+            // SDR white use the display's extended headroom instead of clipping.
+            set_layer_hdr(&entry.window, &layer, color);
             // Keep the hosted root layer sized to the view's ACTUAL current bounds
             // (AppKit won't size a layer-hosting layer for us). Using the live view
             // size — not the stale cur_w/cur_h — means the content fills the window
@@ -1846,6 +1925,30 @@ fn present_frame(
             });
         }
     });
+}
+
+/// Toggle Extended Dynamic Range on a layer to match its content. HDR content
+/// (PQ/HLG transfer) asks the layer for the display's EDR headroom so highlights
+/// exceed SDR white; SDR content clears the flag so a window that stops sending
+/// HDR returns to normal. Logs the display's headroom once — on a Mac/display
+/// with no EDR (headroom ≤ 1.0) the flag is harmless and the wide-gamut image
+/// simply tone-maps to SDR.
+fn set_layer_hdr(window: &NSWindow, layer: &CALayer, color: Option<ColorDesc>) {
+    let hdr = color.map(|c| c.is_hdr()).unwrap_or(false);
+    // `wantsExtendedDynamicRangeContent` is the broadly-available EDR opt-in
+    // (its deprecation just points at the newer `preferredDynamicRange`).
+    #[allow(deprecated)]
+    if layer.wantsExtendedDynamicRangeContent() != hdr {
+        #[allow(deprecated)]
+        layer.setWantsExtendedDynamicRangeContent(hdr);
+        if hdr {
+            let headroom = window
+                .screen()
+                .map(|s| s.maximumPotentialExtendedDynamicRangeColorComponentValue())
+                .unwrap_or(1.0);
+            eprintln!("[mac] EDR enabled; display headroom {headroom:.2}x SDR white");
+        }
+    }
 }
 
 /// Run `f` with implicit CALayer animations disabled, so geometry/content changes
@@ -1874,8 +1977,10 @@ fn present_subframe(
     dst_w: i32,
     dst_h: i32,
     pixels: &[u8],
+    format: PixelFormat,
+    color: Option<ColorDesc>,
 ) {
-    let Some(image) = make_cgimage(width, height, stride, pixels) else {
+    let Some(image) = make_cgimage(width, height, stride, pixels, format, color) else {
         return;
     };
     let scale = crate::input::scale();
@@ -1905,6 +2010,7 @@ fn present_subframe(
         let (_, oy) = subsurface_origin(win_h, x, y, lh);
         let img_ptr: *const CGImage = &*image;
         let obj: &AnyObject = unsafe { &*(img_ptr as *const AnyObject) };
+        set_layer_hdr(&entry.window, &sublayer, color);
         // Disable implicit animations so a moving/updating subsurface (e.g. KWin's
         // cursor) tracks instantly rather than animating behind the pointer.
         without_animations(|| {
@@ -1915,14 +2021,85 @@ fn present_subframe(
     });
 }
 
-/// Build a CGImage from a raw 32-bit little-endian buffer (row 0 = top).
+/// The Core Graphics color space a frame should be tagged with, chosen from its
+/// pixel format and negotiated color description. Pure (no CG calls) so the
+/// mapping can be unit-tested headlessly; `cg_colorspace` turns it into a real
+/// `CGColorSpace`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CgSpace {
+    /// Plain device RGB — ordinary sRGB SDR, the default before HDR existed.
+    DeviceRgb,
+    /// Wide-gamut SDR (Display P3).
+    DisplayP3,
+    /// HDR BT.2100 PQ (ST 2084) — 10-bit integer content.
+    Pq2100,
+    /// HDR BT.2100 HLG.
+    Hlg2100,
+    /// Extended-linear Display P3 — float content, values > 1.0 map to EDR.
+    ExtLinearP3,
+    /// Extended-linear BT.2020 — float content with a wide gamut.
+    ExtLinear2020,
+}
+
+/// Pick the color space for a frame. Float (`Rgba16F`) content is linear light,
+/// so it always uses an extended-linear space (values above 1.0 are the HDR
+/// headroom). Integer content is tagged by its transfer function / primaries.
+fn cg_space_for(format: PixelFormat, color: Option<ColorDesc>) -> CgSpace {
+    match format {
+        PixelFormat::Rgba16F => match color.map(|c| c.primaries) {
+            Some(Primaries::Bt2020) => CgSpace::ExtLinear2020,
+            _ => CgSpace::ExtLinearP3,
+        },
+        _ => match color {
+            Some(c) if c.tf == TransferFn::Pq => CgSpace::Pq2100,
+            Some(c) if c.tf == TransferFn::Hlg => CgSpace::Hlg2100,
+            Some(c) if c.primaries != Primaries::Srgb => CgSpace::DisplayP3,
+            _ => CgSpace::DeviceRgb,
+        },
+    }
+}
+
+fn cg_colorspace(space: CgSpace) -> Option<objc2_core_foundation::CFRetained<CGColorSpace>> {
+    // The name statics are `extern "C"` globals; dereferencing them is unsafe.
+    let name = unsafe {
+        match space {
+            CgSpace::DeviceRgb => return CGColorSpace::new_device_rgb(),
+            CgSpace::DisplayP3 => kCGColorSpaceDisplayP3,
+            CgSpace::Pq2100 => kCGColorSpaceITUR_2100_PQ,
+            CgSpace::Hlg2100 => kCGColorSpaceITUR_2100_HLG,
+            CgSpace::ExtLinearP3 => kCGColorSpaceExtendedLinearDisplayP3,
+            CgSpace::ExtLinear2020 => kCGColorSpaceExtendedLinearITUR_2020,
+        }
+    };
+    CGColorSpace::with_name(Some(name))
+}
+
+/// Bytes per pixel for a format.
+fn bytes_per_pixel(format: PixelFormat) -> i32 {
+    match format {
+        PixelFormat::Bgra8888 | PixelFormat::Rgb2101010 => 4,
+        PixelFormat::Rgba16F => 8,
+    }
+}
+
+/// Build a CGImage from a raw buffer (row 0 = top). For ordinary SDR BGRA8888 it
+/// copies through a bitmap context (as it always has). For wide-gamut / HDR
+/// content it builds the image directly with `CGImageCreate` over a `CFData`
+/// copy of the buffer, tagged with a matching `CGColorSpace` — a bitmap context
+/// can't express 10-bit packing or a PQ/extended-linear space.
+// The `CGBitmapInfo` byte-order/float flags are marked deprecated in the objc2
+// binding but are the documented way to describe the packing to `CGImageCreate`.
+#[allow(deprecated)]
 fn make_cgimage(
     width: i32,
     height: i32,
     stride: i32,
     pixels: &[u8],
+    format: PixelFormat,
+    color: Option<ColorDesc>,
 ) -> Option<objc2_core_foundation::CFRetained<CGImage>> {
-    if width <= 0 || height <= 0 || stride < width * 4 {
+    let bpp = bytes_per_pixel(format);
+    if width <= 0 || height <= 0 || stride < width * bpp {
         return None;
     }
     let needed = (stride as usize) * (height as usize);
@@ -1930,39 +2107,152 @@ fn make_cgimage(
         return None;
     }
 
-    let color_space = CGColorSpace::new_device_rgb()?;
-    // Wayland ARGB8888 is premultiplied; XRGB8888 has alpha bytes = 0xFF so it
-    // reads as fully opaque under the same interpretation. 32-bit little-endian
-    // means B,G,R,A byte order in memory.
-    let bitmap_info =
-        CGImageAlphaInfo::PremultipliedFirst.0 | CGImageByteOrderInfo::Order32Little.0;
+    let space = cg_space_for(format, color);
 
-    let ctx = unsafe {
-        CGBitmapContextCreate(
-            null_mut(),
-            width as usize,
-            height as usize,
-            8,
-            stride as usize,
-            Some(&color_space),
-            bitmap_info,
+    // Fast path: plain SDR BGRA8888 through a bitmap context (unchanged).
+    if format == PixelFormat::Bgra8888 && space == CgSpace::DeviceRgb {
+        let color_space = CGColorSpace::new_device_rgb()?;
+        // Wayland ARGB8888 is premultiplied; XRGB8888 has alpha bytes = 0xFF so it
+        // reads as fully opaque under the same interpretation. 32-bit little-endian
+        // means B,G,R,A byte order in memory.
+        let bitmap_info =
+            CGImageAlphaInfo::PremultipliedFirst.0 | CGImageByteOrderInfo::Order32Little.0;
+
+        let ctx = unsafe {
+            CGBitmapContextCreate(
+                null_mut(),
+                width as usize,
+                height as usize,
+                8,
+                stride as usize,
+                Some(&color_space),
+                bitmap_info,
+            )
+        }?;
+
+        let dst = CGBitmapContextGetData(Some(&ctx));
+        if dst.is_null() {
+            return None;
+        }
+        unsafe {
+            copy_nonoverlapping(pixels.as_ptr(), dst as *mut u8, needed);
+        }
+        return CGBitmapContextCreateImage(Some(&ctx));
+    }
+
+    // Wide-gamut / HDR path: CGImageCreate over a CFData copy of the buffer.
+    let color_space = cg_colorspace(space)?;
+    let data = unsafe {
+        CFData::new(
+            None,
+            pixels.as_ptr(),
+            needed as objc2_core_foundation::CFIndex,
         )
     }?;
+    let provider = CGDataProvider::with_cf_data(Some(&data))?;
 
-    let dst = CGBitmapContextGetData(Some(&ctx));
-    if dst.is_null() {
-        return None;
-    }
+    // (bits/component, bits/pixel, bitmap flags) for each supported layout. Alpha
+    // bits go in the low 5 bits of the bitmap info (CGImageAlphaInfo).
+    let (bpc, bppx, info) = match format {
+        // 32-bit 2:10:10:10, x/A in the top 2 bits → skip-first, 32-bit LE order.
+        PixelFormat::Rgb2101010 => (
+            10usize,
+            32usize,
+            CGBitmapInfo::from_bits_retain(CGImageAlphaInfo::NoneSkipFirst.0)
+                | CGBitmapInfo::ByteOrder32Little,
+        ),
+        // 64-bit four half-floats; Wayland abgr16161616f is R,G,B,A in memory
+        // (little-endian) → alpha last, 16-bit LE order, float components.
+        PixelFormat::Rgba16F => (
+            16usize,
+            64usize,
+            CGBitmapInfo::from_bits_retain(CGImageAlphaInfo::PremultipliedLast.0)
+                | CGBitmapInfo::ByteOrder16Little
+                | CGBitmapInfo::FloatComponents,
+        ),
+        // Wide-gamut 8-bit (e.g. Display P3 SDR): same packing as the SDR path.
+        PixelFormat::Bgra8888 => (
+            8usize,
+            32usize,
+            CGBitmapInfo::from_bits_retain(CGImageAlphaInfo::PremultipliedFirst.0)
+                | CGBitmapInfo::ByteOrder32Little,
+        ),
+    };
+
     unsafe {
-        copy_nonoverlapping(pixels.as_ptr(), dst as *mut u8, needed);
+        CGImage::new(
+            width as usize,
+            height as usize,
+            bpc,
+            bppx,
+            stride as usize,
+            Some(&color_space),
+            info,
+            Some(&provider),
+            null(),
+            false,
+            CGColorRenderingIntent::RenderingIntentDefault,
+        )
     }
-
-    CGBitmapContextCreateImage(Some(&ctx))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{csd_margin, logical_size, subsurface_origin};
+    use super::{
+        bytes_per_pixel, cg_space_for, csd_margin, logical_size, subsurface_origin, CgSpace,
+        ColorDesc, PixelFormat, Primaries, TransferFn,
+    };
+
+    fn desc(tf: TransferFn, primaries: Primaries) -> ColorDesc {
+        ColorDesc {
+            tf,
+            primaries,
+            max_luminance: None,
+            ref_luminance: None,
+        }
+    }
+
+    /// The transfer-function / primaries → Core Graphics color space mapping that
+    /// `make_cgimage` relies on (pure; no AppKit/CG involved).
+    #[test]
+    fn cg_space_maps_transfer_and_primaries() {
+        // No color description + 8-bit → plain device RGB (the SDR default).
+        assert_eq!(
+            cg_space_for(PixelFormat::Bgra8888, None),
+            CgSpace::DeviceRgb
+        );
+        // PQ / HLG → the BT.2100 HDR spaces regardless of the (10-bit) format.
+        assert_eq!(
+            cg_space_for(PixelFormat::Rgb2101010, Some(desc(TransferFn::Pq, Primaries::Bt2020))),
+            CgSpace::Pq2100
+        );
+        assert_eq!(
+            cg_space_for(PixelFormat::Rgb2101010, Some(desc(TransferFn::Hlg, Primaries::Bt2020))),
+            CgSpace::Hlg2100
+        );
+        // Wide-gamut SDR (Display P3, sRGB transfer) → Display P3.
+        assert_eq!(
+            cg_space_for(PixelFormat::Bgra8888, Some(desc(TransferFn::Srgb, Primaries::DisplayP3))),
+            CgSpace::DisplayP3
+        );
+        // Float content is linear light → an extended-linear space (EDR headroom).
+        assert_eq!(
+            cg_space_for(PixelFormat::Rgba16F, Some(desc(TransferFn::Srgb, Primaries::Bt2020))),
+            CgSpace::ExtLinear2020
+        );
+        assert_eq!(
+            cg_space_for(PixelFormat::Rgba16F, None),
+            CgSpace::ExtLinearP3
+        );
+    }
+
+    /// Bytes-per-pixel per format (10-bit stays 4 bytes; float16 is 8).
+    #[test]
+    fn bytes_per_pixel_per_format() {
+        assert_eq!(bytes_per_pixel(PixelFormat::Bgra8888), 4);
+        assert_eq!(bytes_per_pixel(PixelFormat::Rgb2101010), 4);
+        assert_eq!(bytes_per_pixel(PixelFormat::Rgba16F), 8);
+    }
 
     /// A `wp_viewport` destination wins over the buffer size; otherwise the buffer
     /// is divided by the output scale.
