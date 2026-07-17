@@ -172,6 +172,9 @@ mod imp {
             dst_w: w as i32,
             dst_h: h as i32,
             pixels,
+            // RAIL/gfx surfaces are ordinary 8-bit BGRA (SDR); no HDR metadata.
+            format: mac::PixelFormat::Bgra8888,
+            color: None,
             geom: (0, 0, 0, 0),
         });
     }
