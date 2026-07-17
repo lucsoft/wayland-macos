@@ -13,6 +13,7 @@
 use std::fs::OpenOptions;
 use std::os::fd::AsFd;
 
+use log::info;
 use memmap2::MmapMut;
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{
@@ -90,6 +91,21 @@ fn make_solid_buffer(
 }
 
 fn main() {
+    use std::io::Write;
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format(|buf, record| {
+            let ts = buf.timestamp();
+            let thread = std::thread::current().name().unwrap_or("?").to_owned();
+            writeln!(
+                buf,
+                "[{ts} {:5} {}/{thread}] {}",
+                record.level(),
+                record.target(),
+                record.args()
+            )
+        })
+        .init();
+
     let conn = Connection::connect_to_env().expect("connect to WAYLAND_DISPLAY");
     let (globals, mut queue) = registry_queue_init::<State>(&conn).expect("registry init");
     let qh = queue.handle();
@@ -154,7 +170,7 @@ fn main() {
         _icon_keep: icon_keep,
     };
 
-    println!("[client] connected ({}); waiting for configure...", if hdr { "HDR/PQ" } else { "SDR" });
+    info!(target: "client", "connected ({}); waiting for configure...", if hdr { "HDR/PQ" } else { "SDR" });
     while state.running {
         queue.blocking_dispatch(&mut state).expect("dispatch");
     }
@@ -215,7 +231,7 @@ impl State {
         self.surface.attach(Some(&buffer), 0, 0);
         self.surface.damage(0, 0, WIDTH, HEIGHT);
         self.surface.commit();
-        println!("[client] presented {WIDTH}x{HEIGHT} frame");
+        info!(target: "client", "presented {WIDTH}x{HEIGHT} frame");
 
         self._keep = Some((file, mmap, buffer));
     }
@@ -277,7 +293,7 @@ impl State {
         self.surface.attach(Some(&buffer), 0, 0);
         self.surface.damage(0, 0, WIDTH, HEIGHT);
         self.surface.commit();
-        println!("[client] presented {WIDTH}x{HEIGHT} HDR/PQ frame (10-bit BT.2100)");
+        info!(target: "client", "presented {WIDTH}x{HEIGHT} HDR/PQ frame (10-bit BT.2100)");
 
         self._keep = Some((file, mmap, buffer));
     }

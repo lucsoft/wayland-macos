@@ -11,6 +11,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use log::{debug, error, info, warn};
 use memmap2::{Mmap, MmapOptions};
 use rustix::event::{PollFd, PollFlags, Timespec};
 use wayland_server::backend::{ClientData, ClientId, DisconnectReason, ObjectId};
@@ -168,7 +169,7 @@ impl PoolMem {
         }
         match unsafe { MmapOptions::new().len(size as usize).map(&self.fd) } {
             Ok(m) => *self.map.write().unwrap_or_else(|e| e.into_inner()) = Some(m),
-            Err(e) => eprintln!("[wl] warning: failed to remap shm pool ({size} bytes): {e}"),
+            Err(e) => warn!(target: "wl", "failed to remap shm pool ({size} bytes): {e}"),
         }
     }
 }
@@ -181,7 +182,7 @@ fn map_pool(fd: OwnedFd, size: i32) -> PoolMem {
         None
     };
     if map.is_none() {
-        eprintln!("[wl] warning: failed to mmap shm pool ({size} bytes)");
+        warn!(target: "wl", "failed to mmap shm pool ({size} bytes)");
     }
     PoolMem {
         fd,
@@ -1327,7 +1328,7 @@ impl State {
                     .values()
                     .find(|p| p.window_id == window_id)
                     .map(|p| p.popup.clone());
-                eprintln!("[wl] popup dismiss window {window_id}");
+                debug!(target: "wl", "popup dismiss window {window_id}");
                 if let Some(popup) = popup {
                     popup.popup_done();
                 }
@@ -1450,7 +1451,7 @@ fn make_keymap_file() -> Option<(std::fs::File, u32)> {
         xkb::KEYMAP_COMPILE_NO_FLAGS,
     )?;
     let text = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
-    eprintln!("[wl] xkb keymap: layout '{layout}' ({} bytes)", text.len());
+    info!(target: "wl", "xkb keymap: layout '{layout}' ({} bytes)", text.len());
 
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
     let path = format!("{dir}/wlmac-keymap-{}", std::process::id());
@@ -1523,10 +1524,11 @@ pub fn run(bus: Arc<InputBus>) {
         .unwrap_or("wayland-?")
         .to_string();
     let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
-    eprintln!("[wl] listening on {runtime}/{name}");
-    eprintln!("[wl] point a client at it with:");
-    eprintln!("       export XDG_RUNTIME_DIR={runtime}");
-    eprintln!("       export WAYLAND_DISPLAY={name}");
+    info!(target: "wl", "listening on {runtime}/{name}");
+    info!(
+        target: "wl",
+        "point a client at it with:\n       export XDG_RUNTIME_DIR={runtime}\n       export WAYLAND_DISPLAY={name}"
+    );
 
     let mut state = State::new();
     let mut dh = display.handle();
@@ -1563,7 +1565,7 @@ pub fn run(bus: Arc<InputBus>) {
                 Ok(_) => fds[2].revents().contains(PollFlags::IN),
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(e) => {
-                    eprintln!("[wl] poll error: {e}");
+                    error!(target: "wl", "poll error: {e}");
                     break;
                 }
             }
@@ -1574,14 +1576,14 @@ pub fn run(bus: Arc<InputBus>) {
             match socket.accept() {
                 Ok(Some(stream)) => {
                     if let Err(e) = dh.insert_client(stream, Arc::new(ClientState)) {
-                        eprintln!("[wl] insert_client failed: {e}");
+                        error!(target: "wl", "insert_client failed: {e}");
                     } else {
-                        eprintln!("[wl] client connected");
+                        info!(target: "wl", "client connected");
                     }
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    eprintln!("[wl] accept error: {e}");
+                    error!(target: "wl", "accept error: {e}");
                     break;
                 }
             }
@@ -1611,10 +1613,10 @@ pub fn run(bus: Arc<InputBus>) {
         }
 
         if let Err(e) = display.dispatch_clients(&mut state) {
-            eprintln!("[wl] dispatch error: {e}");
+            error!(target: "wl", "dispatch error: {e}");
         }
         if let Err(e) = display.flush_clients() {
-            eprintln!("[wl] flush error: {e}");
+            error!(target: "wl", "flush error: {e}");
         }
         // The flush transmitted any clipboard `send` fds; drop our write ends so
         // the reader threads see EOF. Same for the primary selection.

@@ -12,10 +12,39 @@ mod wayland;
 
 use std::sync::Arc;
 
+use std::io::Write;
+
+use log::info;
 use objc2::MainThreadMarker;
+
+/// stderr logger tagged with timestamp, level, target, and **thread name** — the
+/// thread is the key axis of this codebase (main/AppKit vs `wayland`/`rail` vs
+/// per-app host threads). Level defaults to `info`; filter with `RUST_LOG`.
+fn init_logger() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format(|buf, record| {
+            let ts = buf.timestamp();
+            let thread = std::thread::current().name().unwrap_or("?").to_owned();
+            writeln!(
+                buf,
+                "[{ts} {:5} {}/{thread}] {}",
+                record.level(),
+                record.target(),
+                record.args()
+            )
+        })
+        .init();
+}
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSScreen};
 
 fn main() {
+    // Log to stderr via the `log` facade. Default level is `info`; override per
+    // target with e.g. `RUST_LOG=wl=debug,mac=info`. Targets mirror the former
+    // eprintln prefixes: `wl`, `mac`, `rail`, `router`, `host`, `clipboard`, …
+    // The thread name is included because the whole architecture is a thread
+    // seam (main/AppKit ↔ `wayland`/`rail` ↔ per-app host threads).
+    init_logger();
+
     let args: Vec<String> = std::env::args().collect();
 
     // Window-host child (`--window-host <socket>`): in --multiplex mode the
@@ -57,7 +86,7 @@ fn main() {
         .max()
         .filter(|&s| s >= 1)
         .unwrap_or(1);
-    eprintln!("[wl] display scale = {scale}");
+    info!(target: "wl", "display scale = {scale}");
     input::set_scale(scale);
 
     // Advertise the real screen as the virtual output's size (physical pixels),
@@ -85,7 +114,7 @@ fn main() {
     // comes back over the same sockets and is pushed into this same `bus`, so the
     // Wayland thread consumes it exactly as in the single-process path.
     if multiplex {
-        eprintln!("[wl] multiplex = on (per-app window hosts; compositor hidden)");
+        info!(target: "wl", "multiplex = on (per-app window hosts; compositor hidden)");
         let (out_w, out_h) = input::output_size();
         router::enable(bus.clone(), scale, out_w, out_h);
     }
@@ -97,11 +126,17 @@ fn main() {
     // Run the selected back-end off the main thread; it marshals window
     // operations back to AppKit via the main GCD queue.
     if use_rail {
-        eprintln!("[wl] back-end = RAIL (--use-microsoft-rail-protocol)");
-        std::thread::spawn(move || rail::run(bus));
+        info!(target: "wl", "back-end = RAIL (--use-microsoft-rail-protocol)");
+        std::thread::Builder::new()
+            .name("rail".into())
+            .spawn(move || rail::run(bus))
+            .expect("spawn rail thread");
     } else {
-        eprintln!("[wl] back-end = native Wayland compositor");
-        std::thread::spawn(move || wayland::run(bus));
+        info!(target: "wl", "back-end = native Wayland compositor");
+        std::thread::Builder::new()
+            .name("wayland".into())
+            .spawn(move || wayland::run(bus))
+            .expect("spawn wayland thread");
     }
 
     app.run();

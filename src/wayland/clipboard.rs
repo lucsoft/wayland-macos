@@ -24,6 +24,7 @@ use std::io::{Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
 
+use log::error;
 use wayland_server::backend::ObjectId;
 use wayland_server::protocol::{
     wl_data_device::{self, WlDataDevice},
@@ -134,7 +135,7 @@ impl Clipboard {
         ) {
             Ok(offer) => offer,
             Err(e) => {
-                eprintln!("[clipboard] failed to create data offer: {e}");
+                error!(target: "clipboard", "failed to create data offer: {e}");
                 return;
             }
         };
@@ -200,30 +201,36 @@ fn pick_text_mime(offered: &[String]) -> Option<String> {
 /// Read a client's clipboard bytes to EOF on a background thread, then hand the
 /// text to the macOS pasteboard.
 fn read_text_async(fd: OwnedFd) {
-    std::thread::spawn(move || {
-        let mut file = std::fs::File::from(fd);
-        let mut buf = Vec::new();
-        if file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-            mac::set_clipboard(String::from_utf8_lossy(&buf).into_owned());
-        }
-    });
+    std::thread::Builder::new()
+        .name("clip-read".into())
+        .spawn(move || {
+            let mut file = std::fs::File::from(fd);
+            let mut buf = Vec::new();
+            if file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+                mac::set_clipboard(String::from_utf8_lossy(&buf).into_owned());
+            }
+        })
+        .expect("spawn clip-read thread");
 }
 
 /// Write an offer's bytes into a client's pipe on a background thread, then close
 /// it (dropping the fd) so the client sees EOF.
 fn serve_offer(data: &Arc<OfferData>, fd: OwnedFd) {
     let bytes = data.bytes.clone();
-    std::thread::spawn(move || {
-        let mut file = std::fs::File::from(fd);
-        let _ = file.write_all(&bytes);
-    });
+    std::thread::Builder::new()
+        .name("clip-write".into())
+        .spawn(move || {
+            let mut file = std::fs::File::from(fd);
+            let _ = file.write_all(&bytes);
+        })
+        .expect("spawn clip-write thread");
 }
 
 /// A blocking pipe `(read, write)`. Blocking is intentional: the reader thread
 /// should wait for the client to finish writing.
 fn pipe() -> Option<(OwnedFd, OwnedFd)> {
     rustix::pipe::pipe()
-        .map_err(|e| eprintln!("[clipboard] pipe failed: {e}"))
+        .map_err(|e| error!(target: "clipboard", "pipe failed: {e}"))
         .ok()
 }
 

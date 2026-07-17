@@ -199,7 +199,7 @@ impl Dispatch<XdgPopup, ()> for State {
                 // The menu wants an exclusive pointer grab: route all pointer
                 // input to it and dismiss on outside click.
                 if let Some(p) = state.popups.get(&popup.id()) {
-                    eprintln!("[wl] popup grab -> window {}", p.window_id);
+                    debug!(target: "wl", "popup grab -> window {}", p.window_id);
                     mac::post(WinCmd::SetGrab {
                         window: Some(p.window_id),
                     });

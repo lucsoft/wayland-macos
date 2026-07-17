@@ -17,6 +17,7 @@
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
+use log::{error, info};
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
@@ -53,7 +54,7 @@ pub fn run_window_host(sock_path: &str) -> ! {
         }
         _ => panic!("[host] first frame was not Hello"),
     };
-    eprintln!("[host] up: name={name:?} regular={regular}");
+    info!(target: "host", "up: name={name:?} regular={regular}");
 
     let mtm = MainThreadMarker::new().expect("[host] main thread");
     let app = NSApplication::sharedApplication(mtm);
@@ -78,7 +79,7 @@ pub fn run_window_host(sock_path: &str) -> ! {
     {
         let mut up = stream.try_clone().expect("[host] clone socket for uplink");
         let bus = bus.clone();
-        std::thread::spawn(move || {
+        std::thread::Builder::new().name("host-uplink".into()).spawn(move || {
             let _ = write_frame(&mut up, &Uplink::Ready);
             let mut drain = [0u8; 64];
             loop {
@@ -95,11 +96,11 @@ pub fn run_window_host(sock_path: &str) -> ! {
                     }
                 }
             }
-        });
+        }).expect("spawn host-uplink thread");
     }
 
     // Reader: Downlink frames -> AppKit main thread (GCD), same as in-process.
-    std::thread::spawn(move || loop {
+    std::thread::Builder::new().name("host-reader".into()).spawn(move || loop {
         match read_frame::<_, Downlink>(&mut reader) {
             Ok(Some(Downlink::Cmd(cmd))) => crate::mac::post(cmd),
             Ok(Some(Downlink::Insets(t, r, b, l))) => {
@@ -110,11 +111,11 @@ pub fn run_window_host(sock_path: &str) -> ! {
             }
             Ok(Some(Downlink::Hello { .. })) => {} // ignore a second Hello
             Err(e) => {
-                eprintln!("[host] read error: {e}");
+                error!(target: "host", "read error: {e}");
                 std::process::exit(0);
             }
         }
-    });
+    }).expect("spawn host-reader thread");
 
     app.run();
     std::process::exit(0);

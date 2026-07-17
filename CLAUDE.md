@@ -218,6 +218,20 @@ entirely.
 ## Conventions
 
 - **Code docs, comments, and commit messages are in English.**
+- Logging: use the `log` facade (`info!`/`warn!`/`error!`/`debug!`), never
+  `println!`/`eprintln!`. Pass `target:` to name the subsystem — the targets mirror
+  the old `[wl]`/`[mac]`/`[rail]`/`[router]`/`[host]`/`[clipboard]`/`[primary]`/
+  `[client]` prefixes, e.g. `info!(target: "wl", "…")`. Both binaries init
+  `env_logger` in `main()` (default level `info`); filter at runtime with
+  `RUST_LOG`, e.g. `RUST_LOG=wl=debug,mac=info`. Levels: `error!` for failures,
+  `warn!` for recoverable/unexpected conditions, `info!` for lifecycle/status,
+  `debug!` for chatty per-event traces.
+  The line format is `[timestamp LEVEL target/thread] message` — the **thread
+  name** is included because the thread is the key axis here (main/AppKit ↔
+  `wayland`/`rail` ↔ per-app host threads). Spawn threads via
+  `thread::Builder::new().name(…)` so they show up named rather than as `?`
+  (`wayland`, `rail`, `rail-rdp`, `host-reader`, `host-uplink`, `router-uplink`,
+  `clip-read`, `clip-write`).
 - HiDPI: `src/main.rs` detects the backing scale and screen size once; the
   compositor advertises them via `wl_output`, and `present_frame`/`create_window`
   in `mac.rs` convert physical buffer pixels ↔ logical points. Clients must render

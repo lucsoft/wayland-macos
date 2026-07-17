@@ -102,7 +102,7 @@ impl PrimarySelection {
             ) {
             Ok(offer) => offer,
             Err(e) => {
-                eprintln!("[primary] failed to create offer: {e}");
+                error!(target: "primary", "failed to create offer: {e}");
                 return;
             }
         };

@@ -28,6 +28,8 @@ use std::process::{Child, Command};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use log::{error, info};
+
 use crate::input::InputBus;
 use crate::ipc::{encode_frame, read_frame, write_frame, Downlink, Uplink};
 use crate::mac::WinCmd;
@@ -89,7 +91,7 @@ pub fn assign_window(win_id: u32, app_key: u32, name: &str, regular: bool) {
                     r.helpers.insert(app_key, h);
                 }
                 None => {
-                    eprintln!("[router] failed to spawn host for app {app_key}");
+                    error!(target: "router", "failed to spawn host for app {app_key}");
                     return;
                 }
             }
@@ -272,14 +274,17 @@ fn spawn_helper(app_key: u32, name: &str, regular: bool, r: &Router) -> Option<H
     // Uplink reader: host InputEvents -> compositor InputBus.
     let mut rx = tx.try_clone().ok()?;
     let bus = r.bus.clone();
-    std::thread::spawn(move || loop {
-        match read_frame::<_, Uplink>(&mut rx) {
-            Ok(Some(Uplink::Input(ev))) => bus.push(ev),
-            Ok(Some(Uplink::Ready)) => {}
-            Ok(None) | Err(_) => break,
-        }
-    });
+    std::thread::Builder::new()
+        .name("router-uplink".into())
+        .spawn(move || loop {
+            match read_frame::<_, Uplink>(&mut rx) {
+                Ok(Some(Uplink::Input(ev))) => bus.push(ev),
+                Ok(Some(Uplink::Ready)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        })
+        .expect("spawn router-uplink thread");
 
-    eprintln!("[router] spawned host app={app_key} name={name:?} regular={regular}");
+    info!(target: "router", "spawned host app={app_key} name={name:?} regular={regular}");
     Some(Helper { tx, child, app_dir })
 }

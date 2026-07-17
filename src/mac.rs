@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dispatch2::{DispatchQueue, DispatchTime};
+use log::{error, info};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -156,7 +157,7 @@ pub fn set_clipboard(text: String) {
         pb.clearContents();
         let ok = pb.setString_forType(&NSString::from_str(&text), unsafe { NSPasteboardTypeString });
         if !ok {
-            eprintln!("[mac] clipboard: setString failed");
+            error!(target: "mac", "clipboard: setString failed");
         }
         // Mark this change as self-authored so the watcher won't re-emit it.
         let c = pb.changeCount();
@@ -1135,7 +1136,7 @@ pub(crate) fn set_app_icon(
 ) {
     let Some(image) = make_cgimage(width, height, stride, pixels, PixelFormat::Bgra8888, None)
     else {
-        eprintln!("[mac] failed to build CGImage for app icon");
+        error!(target: "mac", "failed to build CGImage for app icon");
         return;
     };
     let size = CGSize::new(width as f64, height as f64);
@@ -1144,7 +1145,7 @@ pub(crate) fn set_app_icon(
     unsafe {
         NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&ns_image));
     }
-    eprintln!("[mac] set app icon {width}x{height}");
+    info!(target: "mac", "set app icon {width}x{height}");
 }
 
 fn make_cursor(
@@ -1663,8 +1664,9 @@ fn create_window(
             },
         );
     });
-    eprintln!(
-        "[mac] created NSWindow for toplevel {id} ({lw}x{lh} pts, buffer {width}x{height})"
+    info!(
+        target: "mac",
+        "created NSWindow for toplevel {id} ({lw}x{lh} pts, buffer {width}x{height})"
     );
 }
 
@@ -1781,7 +1783,7 @@ fn create_layer_window(
             },
         );
     });
-    eprintln!("[mac] created layer window {id} ({lw}x{lh} pts) anchor={anchor}");
+    info!(target: "mac", "created layer window {id} ({lw}x{lh} pts) anchor={anchor}");
 }
 
 /// Create a borderless popup window (menu/dropdown) as a child of its parent,
@@ -1903,7 +1905,7 @@ fn create_popup(
             focused: true,
         });
     }
-    eprintln!("[mac] created popup {id} under {parent_id} at ({x},{y}) {width}x{height}");
+    info!(target: "mac", "created popup {id} under {parent_id} at ({x},{y}) {width}x{height}");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1921,7 +1923,7 @@ fn present_frame(
     geom: (i32, i32, i32, i32),
 ) {
     let Some(image) = make_cgimage(width, height, stride, pixels, format, color) else {
-        eprintln!("[mac] failed to build CGImage for {id}");
+        error!(target: "mac", "failed to build CGImage for {id}");
         return;
     };
     let scale = crate::input::scale();
@@ -2023,7 +2025,7 @@ fn set_layer_hdr(window: &NSWindow, layer: &CALayer, color: Option<ColorDesc>) {
                 .screen()
                 .map(|s| s.maximumPotentialExtendedDynamicRangeColorComponentValue())
                 .unwrap_or(1.0);
-            eprintln!("[mac] EDR enabled; display headroom {headroom:.2}x SDR white");
+            info!(target: "mac", "EDR enabled; display headroom {headroom:.2}x SDR white");
         }
     }
 }

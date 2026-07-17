@@ -33,6 +33,7 @@ use crate::input::InputBus;
 #[cfg(feature = "rail")]
 mod imp {
     use super::*;
+    use log::{debug, info, warn};
     use std::ffi::{c_char, c_int, c_void, CStr, CString};
     use std::os::fd::OwnedFd;
     use std::ptr;
@@ -116,7 +117,7 @@ mod imp {
         if w == 0 || h == 0 {
             return;
         }
-        eprintln!("[rail] window create id={id} {w}x{h} title={:?}", cstr(title));
+        info!(target: "rail", "window create id={id} {w}x{h} title={:?}", cstr(title));
         LIVE_WINDOWS.lock().unwrap().push(id);
         mac::post(WinCmd::Create {
             id,
@@ -156,7 +157,7 @@ mod imp {
     }
 
     extern "C" fn on_window_delete(_user: *mut c_void, id: u32) {
-        eprintln!("[rail] window delete id={id}");
+        info!(target: "rail", "window delete id={id}");
         LIVE_WINDOWS.lock().unwrap().retain(|&w| w != id);
         mac::post(WinCmd::Destroy { id });
     }
@@ -174,7 +175,7 @@ mod imp {
         }
         static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
         if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!("[rail] first surface frame id={id} {w}x{h} stride={stride}");
+            debug!(target: "rail", "first surface frame id={id} {w}x{h} stride={stride}");
         }
         let len = stride as usize * h as usize;
         let pixels = unsafe { std::slice::from_raw_parts(pixels, len) }.to_vec();
@@ -195,7 +196,7 @@ mod imp {
     }
 
     extern "C" fn on_disconnected(_user: *mut c_void) {
-        eprintln!("[rail] RDP session disconnected");
+        warn!(target: "rail", "RDP session disconnected");
         // The session is gone; close every window it opened. Draining the list
         // also stops a late `window_delete` from double-destroying.
         let live: Vec<u32> = std::mem::take(&mut *LIVE_WINDOWS.lock().unwrap());
@@ -236,7 +237,7 @@ mod imp {
             .ok()
             .filter(|a| !a.is_empty())
             .unwrap_or_else(|| "weston-terminal".to_string());
-        eprintln!("[rail] connecting to {host}:{port} (RemoteApp/RAIL)");
+        info!(target: "rail", "connecting to {host}:{port} (RemoteApp/RAIL)");
 
         let (wake_r, wake_w) = waker_pipe();
         bus.set_waker(wake_w);
@@ -244,7 +245,7 @@ mod imp {
         // FreeRDP event loop on its own thread (blocking).
         let host_c = CString::new(host).expect("host");
         let app_c = CString::new(app).expect("app");
-        std::thread::spawn(move || {
+        std::thread::Builder::new().name("rail-rdp".into()).spawn(move || {
             let cb = RailCallbacks {
                 user: ptr::null_mut(),
                 window_create: on_window_create,
@@ -255,8 +256,8 @@ mod imp {
                 disconnected: on_disconnected,
             };
             let rc = unsafe { rail_run(host_c.as_ptr(), port, app_c.as_ptr(), &cb) };
-            eprintln!("[rail] rail_run returned {rc}");
-        });
+            warn!(target: "rail", "rail_run returned {rc}");
+        }).expect("spawn rail-rdp thread");
 
         // Input drain loop: block on the waker pipe, then forward to RDP.
         let mut last_x = 0i32;
@@ -323,10 +324,11 @@ pub use imp::run;
 /// FreeRDP isn't linked, so the mode can't run. Point the user at the rebuild.
 #[cfg(not(feature = "rail"))]
 pub fn run(_bus: Arc<InputBus>) {
-    eprintln!(
-        "[rail] --use-microsoft-rail-protocol requires a build with the `rail` \
+    log::error!(
+        target: "rail",
+        "--use-microsoft-rail-protocol requires a build with the `rail` \
          feature (FreeRDP)."
     );
-    eprintln!("[rail] Rebuild with:  cargo build --features rail   (needs `brew install freerdp`)");
-    eprintln!("[rail] Falling back to no windows; run without the flag for the native compositor.");
+    log::error!(target: "rail", "Rebuild with:  cargo build --features rail   (needs `brew install freerdp`)");
+    log::error!(target: "rail", "Falling back to no windows; run without the flag for the native compositor.");
 }

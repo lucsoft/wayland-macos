@@ -50,6 +50,11 @@ libc = "0.2"
 # it); hand-rolling a codec for ~25 WinCmd variants is where silent wire bugs hide.
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
+# Logging: the `log` facade (level macros + per-module `target:`) with the
+# `env_logger` backend (filter via RUST_LOG, e.g. `RUST_LOG=wl=debug,mac=info`).
+# The old `[wl]`/`[mac]`/… eprintln prefixes are now log targets.
+log = "0.4"
+env_logger = "0.11"
 
 # Used only by the test client binary (src/bin/testclient.rs).
 wayland-client = "0.31"
