@@ -1564,6 +1564,12 @@ fn subsurface_origin(win_h: f64, x: i32, y: i32, lh: f64) -> (f64, f64) {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// True when running the RAIL back-end (`--use-microsoft-rail-protocol`). Set
+/// once at startup; read in `create_window` to keep RAIL windows non-resizable
+/// (see the style block there).
+pub static RAIL_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn create_window(
     mtm: MainThreadMarker,
     id: u32,
@@ -1590,6 +1596,13 @@ fn create_window(
             | NSWindowStyleMask::Closable
             | NSWindowStyleMask::Miniaturizable
             | NSWindowStyleMask::Resizable
+    } else if RAIL_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        // RAIL windows carry the app's own CSD (titlebar + resize borders) and
+        // delegate move/resize to the remote server via forwarded pointer motion.
+        // A natively Resizable borderless window makes macOS steal titlebar drags
+        // as edge-resizes (the titlebar sits flush at the top edge), so weston
+        // never sees the drag and never sends a move order. Keep it non-resizable.
+        NSWindowStyleMask::Borderless
     } else {
         NSWindowStyleMask::Borderless | NSWindowStyleMask::Resizable
     };

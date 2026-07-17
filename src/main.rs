@@ -127,6 +127,7 @@ fn main() {
     // operations back to AppKit via the main GCD queue.
     if use_rail {
         info!(target: "wl", "back-end = RAIL (--use-microsoft-rail-protocol)");
+        mac::RAIL_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
         std::thread::Builder::new()
             .name("rail".into())
             .spawn(move || rail::run(bus))
