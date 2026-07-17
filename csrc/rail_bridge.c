@@ -187,8 +187,25 @@ static UINT rail_update_surface_area(RdpgfxClientContext *gfx, UINT16 surfaceId,
         surface->windowId != 0 ? (uint32_t)surface->windowId : g_main_window_id;
     if (win == 0)
         return CHANNEL_RC_OK;
-    /* Surfaces are BGRA32 (gdi initialised with PIXEL_FORMAT_BGRA32). Send the
-     * whole surface as a frame for the window. */
+    /* Surfaces are BGRA32 (gdi initialised with PIXEL_FORMAT_BGRA32). The gfx
+     * surface is the window rounded up to 16-px alignment (e.g. 806x491 -> a
+     * 816x496 surface), so the extra rows/cols are padding, not content. Crop to
+     * the RAIL window's logical size (top-left) so the window has no dead margin. */
+    rail_window *rw = win_find(g_ctx, win);
+    if (rw && rw->w > 0 && rw->h > 0 && (uint32_t)rw->w <= surface->width &&
+        (uint32_t)rw->h <= surface->height &&
+        ((uint32_t)rw->w != surface->width || (uint32_t)rw->h != surface->height)) {
+        uint32_t cw = (uint32_t)rw->w, ch = (uint32_t)rw->h, cstride = cw * 4;
+        uint8_t *buf = (uint8_t *)malloc((size_t)cstride * ch);
+        if (buf) {
+            for (uint32_t r = 0; r < ch; r++)
+                memcpy(buf + (size_t)r * cstride,
+                       surface->data + (size_t)r * surface->scanline, cstride);
+            g_cb.window_surface(g_cb.user, win, cw, ch, cstride, buf);
+            free(buf);
+            return CHANNEL_RC_OK;
+        }
+    }
     g_cb.window_surface(g_cb.user, win, surface->width, surface->height,
                         surface->scanline, surface->data);
     return CHANNEL_RC_OK;
