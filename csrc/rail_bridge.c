@@ -367,6 +367,18 @@ static UINT rail_on_server_handshake_ex(RailClientContext *rail,
     return rail_send_client_status(rail);
 }
 
+/* The server delegates an interactive move/size to the client (the user grabbed
+ * the app's CSD titlebar). For a MOVE we ask Rust to start a native NSWindow
+ * drag; RAIL is "local" move, so the client owns the operation from here. */
+static UINT rail_on_server_local_move_size(RailClientContext *rail,
+                                           const RAIL_LOCALMOVESIZE_ORDER *o) {
+    (void)rail;
+    if (o && o->isMoveSizeStart && o->moveSizeType == RAIL_WMSZ_MOVE &&
+        g_cb.window_move_start)
+        g_cb.window_move_start(g_cb.user, o->windowId);
+    return CHANNEL_RC_OK;
+}
+
 /* ---- channel wiring (gfx -> gdi) --------------------------------------- */
 
 static void on_channel_connected(void *context, ChannelConnectedEventArgs *e) {
@@ -392,6 +404,7 @@ static void on_channel_connected(void *context, ChannelConnectedEventArgs *e) {
         rail->custom = ctx;
         rail->ServerHandshake = rail_on_server_handshake;
         rail->ServerHandshakeEx = rail_on_server_handshake_ex;
+        rail->ServerLocalMoveSize = rail_on_server_local_move_size;
         /* Publish for the main loop to proactively start RAIL after this handler
          * returns — sending PDUs from inside the channel-connected callback is
          * re-entrant within freerdp_check_event_handles and breaks the loop. */

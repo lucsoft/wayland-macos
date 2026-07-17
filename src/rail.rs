@@ -67,6 +67,7 @@ mod imp {
         window_delete: extern "C" fn(*mut c_void, u32),
         window_surface: extern "C" fn(*mut c_void, u32, u32, u32, u32, *const u8),
         disconnected: extern "C" fn(*mut c_void),
+        window_move_start: extern "C" fn(*mut c_void, u32),
     }
 
     extern "C" {
@@ -198,6 +199,14 @@ mod imp {
         });
     }
 
+    /// The server asked us to move a window locally (the user grabbed the app's
+    /// own CSD titlebar). Trigger the existing native NSWindow drag — the next
+    /// pointer-drag event hands off to `performWindowDragWithEvent`.
+    extern "C" fn on_window_move_start(_user: *mut c_void, id: u32) {
+        debug!(target: "rail", "server local move-size (move) id={id}");
+        mac::post(WinCmd::StartMove { id });
+    }
+
     extern "C" fn on_disconnected(_user: *mut c_void) {
         warn!(target: "rail", "RDP session disconnected");
         // The session is gone; close every window it opened. Draining the list
@@ -268,6 +277,7 @@ mod imp {
                 window_delete: on_window_delete,
                 window_surface: on_window_surface,
                 disconnected: on_disconnected,
+                window_move_start: on_window_move_start,
             };
             let rc = unsafe {
                 rail_run(

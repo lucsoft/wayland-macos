@@ -39,6 +39,10 @@ typedef struct {
                            uint32_t stride, const uint8_t *pixels);
     /* The session ended (disconnected or failed to connect). */
     void (*disconnected)(void *user);
+    /* The server asked the client to move the window locally — the user grabbed
+     * the app's own titlebar (RAIL Server Local Move/Size, type MOVE). The Rust
+     * side turns this into a native NSWindow drag. */
+    void (*window_move_start)(void *user, uint32_t id);
 } rail_callbacks;
 
 /* Connect to host:port, launch/attach the RemoteApp `app`, and run the FreeRDP
