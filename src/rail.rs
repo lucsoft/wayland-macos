@@ -74,6 +74,9 @@ mod imp {
             host: *const c_char,
             port: c_int,
             app: *const c_char,
+            desktop_w: u32,
+            desktop_h: u32,
+            scale: u32,
             cb: *const RailCallbacks,
         ) -> c_int;
         fn rail_send_pointer(window_id: u32, local_x: i32, local_y: i32, flags: u16);
@@ -242,6 +245,17 @@ mod imp {
         let (wake_r, wake_w) = waker_pipe();
         bus.set_waker(wake_w);
 
+        // Advertise the Mac's real display so the server sizes its desktop to our
+        // monitor (not a hardcoded 1920x1080). output_size() is physical px; send
+        // the *logical* size at scale 1 — advertising scale 2 doubles the window
+        // geometry but non-HiDPI apps (weston-terminal) still render 1x, giving a
+        // huge blurry window. (True per-app HiDPI is a separate change.)
+        let mac_scale = crate::input::scale().max(1);
+        let (phys_w, phys_h) = crate::input::output_size();
+        let out_w = (phys_w / mac_scale).max(1);
+        let out_h = (phys_h / mac_scale).max(1);
+        let scale = 1u32;
+
         // FreeRDP event loop on its own thread (blocking).
         let host_c = CString::new(host).expect("host");
         let app_c = CString::new(app).expect("app");
@@ -255,7 +269,17 @@ mod imp {
                 window_surface: on_window_surface,
                 disconnected: on_disconnected,
             };
-            let rc = unsafe { rail_run(host_c.as_ptr(), port, app_c.as_ptr(), &cb) };
+            let rc = unsafe {
+                rail_run(
+                    host_c.as_ptr(),
+                    port,
+                    app_c.as_ptr(),
+                    out_w as u32,
+                    out_h as u32,
+                    scale,
+                    &cb,
+                )
+            };
             warn!(target: "rail", "rail_run returned {rc}");
         }).expect("spawn rail-rdp thread");
 

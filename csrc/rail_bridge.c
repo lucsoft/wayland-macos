@@ -458,8 +458,8 @@ static void rail_client_free(freerdp *instance, rdpContext *context) {
 
 /* ---- public API -------------------------------------------------------- */
 
-int rail_run(const char *host, int port, const char *app,
-             const rail_callbacks *cb) {
+int rail_run(const char *host, int port, const char *app, uint32_t desktop_w,
+             uint32_t desktop_h, uint32_t scale, const rail_callbacks *cb) {
     setvbuf(stderr, NULL, _IONBF, 0); /* unbuffered so diagnostics flush live */
     g_rail_started = 0;
     g_rail = NULL;
@@ -544,8 +544,15 @@ int rail_run(const char *host, int port, const char *app,
      * client drops them. Instead the cliprdr channel is given a valid `custom`
      * pointer in on_channel_connected so its caps PDU doesn't error. */
     freerdp_settings_set_uint32(s, FreeRDP_ColorDepth, 32);
-    freerdp_settings_set_uint32(s, FreeRDP_DesktopWidth, 1920);
-    freerdp_settings_set_uint32(s, FreeRDP_DesktopHeight, 1080);
+    /* Advertise the Mac's real display: physical pixel size + HiDPI scale. Weston
+     * (WESTON_RDP_HI_DPI_SCALING defaults on) uses DesktopScaleFactor to render
+     * apps at that scale, so a 2x display gets crisp 2x surfaces shown 1:1. */
+    freerdp_settings_set_uint32(s, FreeRDP_DesktopWidth, desktop_w > 0 ? desktop_w : 1920);
+    freerdp_settings_set_uint32(s, FreeRDP_DesktopHeight, desktop_h > 0 ? desktop_h : 1080);
+    if (scale >= 1) {
+        freerdp_settings_set_uint32(s, FreeRDP_DesktopScaleFactor, scale * 100);
+        freerdp_settings_set_uint32(s, FreeRDP_DeviceScaleFactor, 100);
+    }
 
     if (!freerdp_connect(instance)) {
         g_cb.disconnected(g_cb.user);

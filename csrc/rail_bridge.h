@@ -44,8 +44,8 @@ typedef struct {
 /* Connect to host:port, launch/attach the RemoteApp `app`, and run the FreeRDP
  * event loop until disconnect or rail_stop(). Blocking — call on a dedicated
  * thread. Returns 0 on a clean session, non-zero on connect failure. */
-int rail_run(const char *host, int port, const char *app,
-             const rail_callbacks *cb);
+int rail_run(const char *host, int port, const char *app, uint32_t desktop_w,
+             uint32_t desktop_h, uint32_t scale, const rail_callbacks *cb);
 
 /* Forward a pointer event for a window. `local_x`/`local_y` are surface-local
  * pixels (top-left origin); the bridge adds the window's desktop offset.
