@@ -293,8 +293,8 @@ static UINT rail_update_surface_area(RdpgfxClientContext *gfx, UINT16 surfaceId,
 static UINT rail_map_window_for_surface(RdpgfxClientContext *gfx,
                                         UINT16 surfaceID, UINT64 windowID) {
     (void)gfx;
-    fprintf(stderr, "[rail-c] map surface %u -> window %llu\n", surfaceID,
-            (unsigned long long)windowID);
+    bridge_log(RAIL_LOG_INFO, "map surface %u -> window %llu", surfaceID,
+               (unsigned long long)windowID);
     if (g_ctx)
         surf_map_set(g_ctx, surfaceID, (uint32_t)windowID);
     return CHANNEL_RC_OK;
