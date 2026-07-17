@@ -89,6 +89,15 @@ services:
       # Any Wayland app; weston-terminal ships with Weston, gnome-calculator is
       # also installed in the image.
       APP: "weston-terminal"
+      # Audio runs out-of-band (RDP carries none to a usable macOS sink): apps
+      # stream to the Mac's PulseAudio daemon on :4713 (see entrypoint-rail.sh).
+      # RDP flows Mac->container, but audio flows container->Mac, so the container
+      # still needs to reach the host — hence MAC_HOST + the gateway mapping below.
+      MAC_HOST: host.docker.internal
+    # host.docker.internal resolves automatically on Docker Desktop; this mapping
+    # is a safety net for other setups (and is what lets audio reach the Mac).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   # Firefox (GTK/Wayland) as a native macOS window. Launch with:
   #   docker compose --profile firefox up wayland-firefox

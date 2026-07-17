@@ -122,13 +122,20 @@ container connect to it via `PULSE_SERVER=tcp:host.docker.internal:4713`.
 Linux app ──libpulse──> PULSE_SERVER (tcp) ──> PulseAudio on macOS ──> CoreAudio
 ```
 
-- **Mac side:** `scripts/mac-side.sh` starts the daemon from
-  `scripts/pulseaudio-mac.pa` if `pulseaudio` is installed (`brew install
-  pulseaudio`); otherwise it prints a hint and continues without audio.
-  `scripts/stop.sh` tears it down.
-- **Container side:** `docker/entrypoint.sh` exports `PULSE_SERVER` (pointing at
+- **Mac side:** `scripts/mac-side.sh` starts the daemon (via
+  `scripts/pulseaudio-mac.sh`, from the `scripts/pulseaudio-mac.pa` config) if
+  `pulseaudio` is installed (`brew install pulseaudio`); otherwise it prints a
+  hint and continues without audio. `scripts/stop.sh` tears it down. The RAIL
+  back-end doesn't use `mac-side.sh`, so start the daemon there by running
+  `scripts/pulseaudio-mac.sh` directly (idempotent).
+- **Container side:** `docker/entrypoint.sh` (waypipe) and
+  `docker/entrypoint-rail.sh` (RAIL) export `PULSE_SERVER` (pointing at
   `MAC_HOST`), and the images ship the PulseAudio client libraries. If the Mac
   has no daemon running, apps simply start muted — nothing else breaks.
+- **Same channel in RAIL mode:** RDP/RAIL carries no audio to a usable macOS sink
+  either (the Mac-side FreeRDP is built without a Pulse/ALSA backend), so RAIL
+  reuses this exact out-of-band PulseAudio channel — the container is the RDP
+  server but the audio still flows container → Mac.
 - **Test it:** `pactl list sinks short` on the Mac shows the CoreAudio sink;
   inside a running container, `paplay /usr/share/sounds/…` (or a video in the
   `firefox` profile) should come out of the Mac's speakers.

@@ -173,12 +173,20 @@ out-of-band channel that never touches the compositor: a PulseAudio daemon on th
 Mac (`scripts/pulseaudio-mac.pa`, started by `mac-side.sh`) exposes CoreAudio as
 Pulse sinks/sources and listens on TCP 4713; the container's `entrypoint.sh` sets
 `PULSE_SERVER=tcp:${MAC_HOST}:4713` so libpulse clients stream straight to it. The
-Dockerfiles ship the PulseAudio client libs (`pulseaudio-utils`; the Debian image
-adds `gstreamer1.0-pulseaudio` for Qt/GTK media). It's optional and degrades
-cleanly: no `pulseaudio` on the Mac (`brew install pulseaudio`) → `mac-side.sh`
-prints a hint and apps start muted; nothing else breaks. This is not a native
-macOS integration (those live on the Wayland socket) — it bypasses waypipe
-entirely.
+Dockerfiles ship the PulseAudio client libs (`pulseaudio-utils`; the Debian and
+RAIL images add `gstreamer1.0-pulseaudio` for Qt/GTK media). It's optional and
+degrades cleanly: no `pulseaudio` on the Mac (`brew install pulseaudio`) →
+`scripts/pulseaudio-mac.sh` prints a hint and apps start muted; nothing else
+breaks. This is not a native macOS integration (those live on the Wayland socket)
+— it bypasses waypipe entirely.
+
+The **RAIL back-end reuses this same channel** — RDP/RAIL carries no audio to a
+usable macOS sink (the Mac-side FreeRDP is built `-DWITH_PULSE=OFF
+-DWITH_ALSA=OFF`), so `docker/entrypoint-rail.sh` exports the same `PULSE_SERVER`
+and the RAIL container streams container→Mac even though it's the RDP *server*.
+The daemon-start logic lives in `scripts/pulseaudio-mac.sh` (called by
+`mac-side.sh`; run it directly for a RAIL-only session, which doesn't use
+`mac-side.sh`).
 
 ## Containers
 

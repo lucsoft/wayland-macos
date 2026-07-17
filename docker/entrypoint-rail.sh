@@ -15,6 +15,16 @@ HEIGHT="${RDP_HEIGHT:-1080}"
 APP="${APP:-weston-terminal}"
 WL_SOCK="wayland-rail"
 
+# Audio: RDP/RAIL carries no audio to a usable macOS sink, so — like the waypipe
+# path (docker/entrypoint.sh) — audio takes its own TCP channel straight to the
+# Mac's PulseAudio daemon on :4713 (started by scripts/pulseaudio-mac.sh, which
+# bridges to CoreAudio). Here the container is the RDP *server* and the Mac dials
+# in, but the audio channel still runs container->Mac, so we reach back via
+# MAC_HOST (host.docker.internal on Docker Desktop). Exported so the app and its
+# D-Bus-activated helpers inherit it; if the Mac has no daemon, apps start muted.
+export PULSE_SERVER="${PULSE_SERVER:-tcp:${MAC_HOST:-host.docker.internal}:4713}"
+echo "[rail-container] audio -> ${PULSE_SERVER}"
+
 CERT_DIR="/etc/weston-rail"
 CERT="${CERT_DIR}/rdp.crt"
 KEY="${CERT_DIR}/rdp.key"

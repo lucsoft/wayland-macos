@@ -55,9 +55,16 @@ RUN git clone --depth 1 https://github.com/microsoft/FreeRDP-mirror.git /src/Fre
 # EGL/GLES headers for Weston's demo clients (weston-terminal etc.). Separate
 # layer after the FreeRDP build so it stays cached. libweston itself uses the
 # Pixman software renderer (-Drenderer-gl=false); this is only for demo clients.
+#
+# Audio: RDP/RAIL carries no audio to a usable macOS sink (the Mac-side FreeRDP
+# has no Pulse/ALSA backend), so — exactly as in the waypipe image — apps stream
+# out-of-band to the Mac's PulseAudio daemon via PULSE_SERVER (see
+# entrypoint-rail.sh). pulseaudio-utils gives libpulse + `paplay`;
+# gstreamer1.0-pulseaudio lets GTK/Qt media route through Pulse.
 RUN apt-get update -qq \
  && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=8 install -y --no-install-recommends \
       libegl-dev libgles-dev librsvg2-dev \
+      pulseaudio-utils gstreamer1.0-pulseaudio \
  && rm -rf /var/lib/apt/lists/*
 
 # --- Microsoft Weston fork (rdp backend + rdprail shell) ------------------
