@@ -55,7 +55,12 @@ rm -f "$SOCK"
 # `fork`: waypipe may open more than one transport connection, so the bridge must
 # keep accepting (a single-connection socat would ECONNREFUSED the rest). Teardown
 # is driven by the app process exiting (below), not by socat.
-socat "UNIX-LISTEN:${SOCK},reuseaddr,fork" "TCP:${HOST}:${PORT}" &
+# `nodelay`: disable Nagle's algorithm. The Wayland wire is a chatty request/reply
+# protocol of small messages; with Nagle, a reply (e.g. wl_output geometry after a
+# bind) can stall for hundreds of ms, which makes Qt clients give up on output
+# detection during startup and fall back to a 0x0 placeholder screen — breaking
+# popup/menu positioning. nodelay flushes each message immediately.
+socat "UNIX-LISTEN:${SOCK},reuseaddr,fork" "TCP:${HOST}:${PORT},nodelay" &
 pids+=($!)
 
 # Wait for the bridge socket to appear.

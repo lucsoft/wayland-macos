@@ -9,10 +9,105 @@ services:
     environment:
       MAC_HOST: host.docker.internal
       BRIDGE_PORT: "7777"
-      # Any installed Wayland app: gnome-text-editor, gnome-calculator,
-      # weston-simple-shm (pure-shm sanity check), weston-terminal, ...
-      APP: "gnome-text-editor"
+      # Any installed Wayland app: kgx (GNOME Console), gnome-calculator, nautilus…
+      # (gnome-text-editor isn't in Alpine's `gnome` metapackage; add it to the
+      # Dockerfile if you want it.)
+      APP: "kgx"
     # host.docker.internal resolves automatically on Docker Desktop; this mapping
     # is a safety net for other setups.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # KDE Plasma (KWin nested) on a glibc base. Gated behind the "kde" profile so a
+  # plain `docker compose up` still starts only the GNOME app service above.
+  # Launch with:  docker compose --profile kde up wayland-kde
+  # The image's default APP runs KWin + konsole at 2x scale (see Dockerfile.kde-debian).
+  wayland-kde:
+    profiles: ["kde"]
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.kde-debian
+    image: wayland-macos-kde-debian
+    environment:
+      MAC_HOST: host.docker.internal
+      BRIDGE_PORT: "7777"
+      # Override to change the display scale, size, or run the full shell, e.g.:
+      #   APP: "kwin_wayland --wayland-display wayland-0 --socket wayland-1 --width 1280 --height 800 --scale 2 --output-count 1 plasmashell"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # A standalone docked bar (waybar) via wlr-layer-shell — an "appbar" anchored to
+  # the top of the screen, floating over other windows on all Spaces.
+  # Launch with:  docker compose --profile bar up wayland-bar
+  wayland-bar:
+    profiles: ["bar"]
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.kde-debian
+    image: wayland-macos-kde-debian
+    environment:
+      MAC_HOST: host.docker.internal
+      BRIDGE_PORT: "7777"
+      APP: "waybar"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # A minimal "shell": docked bar (waybar) + app launcher (fuzzel), both via
+  # wlr-layer-shell. fuzzel lets you type an app name to launch it as its own
+  # native window. Launch with:  docker compose --profile shell up wayland-shell
+  wayland-shell:
+    profiles: ["shell"]
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.kde-debian
+    image: wayland-macos-kde-debian
+    environment:
+      MAC_HOST: host.docker.internal
+      BRIDGE_PORT: "7777"
+      APP: "/usr/local/bin/run-shell.sh"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # RAIL back-end: Weston running as an RDP server (the WSLg-style model), for
+  # the compositor's `--use-microsoft-rail-protocol` mode. Unlike the waypipe
+  # services above, the container is the SERVER and the Mac dials in — so this
+  # publishes the RDP port instead of setting MAC_HOST. Launch with:
+  #   docker compose --profile rail up wayland-rail
+  # then on macOS:  <compositor> --use-microsoft-rail-protocol  (connects to :3389)
+  wayland-rail:
+    profiles: ["rail"]
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.rail
+    image: wayland-macos-rail
+    ports:
+      - "3389:3389"
+    environment:
+      RDP_PORT: "3389"
+      RDP_WIDTH: "1920"
+      RDP_HEIGHT: "1080"
+      # Any Wayland app; weston-terminal ships with Weston, gnome-calculator is
+      # also installed in the image.
+      APP: "weston-terminal"
+
+  # Firefox (GTK/Wayland) as a native macOS window. Launch with:
+  #   docker compose --profile firefox up wayland-firefox
+  wayland-firefox:
+    profiles: ["firefox"]
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.kde-debian
+    image: wayland-macos-kde-debian
+    # Firefox crashes with Docker's default 64MB /dev/shm; give it room.
+    shm_size: "2gb"
+    environment:
+      MAC_HOST: host.docker.internal
+      BRIDGE_PORT: "7777"
+      # MOZ_ENABLE_WAYLAND: render as a native Wayland client (not XWayland).
+      # MOZ_DISABLE_CONTENT_SANDBOX: Firefox's content sandbox needs syscalls
+      #   Docker's default seccomp blocks; without this, tabs crash on start.
+      # LIBGL_ALWAYS_SOFTWARE (from the image) forces software WebRender since the
+      #   compositor is shm-only (no GPU).
+      APP: "env MOZ_ENABLE_WAYLAND=1 MOZ_DISABLE_CONTENT_SANDBOX=1 firefox-esr --no-remote"
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -1,0 +1,11 @@
+{
+  "KPlugin": {
+    "Id": "showwindows",
+    "Name": "Show Windows",
+    "Description": "Activate and maximize client windows as they appear (needed for a bare nested KWin session with no shell to manage/repaint windows).",
+    "EnabledByDefault": true
+  },
+  "KPackageStructure": "KWin/Script",
+  "X-Plasma-API": "javascript",
+  "X-Plasma-MainScript": "code/main.js"
+}

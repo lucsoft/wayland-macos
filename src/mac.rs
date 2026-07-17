@@ -6,7 +6,7 @@
 //! `thread_local` registry maps Wayland toplevel ids to their `NSWindow`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ptr::{copy_nonoverlapping, null_mut};
 use std::sync::Arc;
 
@@ -17,11 +17,14 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSColor, NSEvent, NSEventModifierFlags, NSPasteboard,
-    NSPasteboardTypeString, NSPopUpMenuWindowLevel, NSTrackingArea, NSTrackingAreaOptions, NSView,
-    NSWindow, NSWindowDelegate, NSWindowOrderingMode, NSWindowStyleMask,
+    NSApplication, NSBackingStoreType, NSColor, NSCursor, NSEvent, NSEventModifierFlags, NSImage,
+    NSModalPanelWindowLevel, NSNormalWindowLevel, NSPasteboard, NSPasteboardTypeString,
+    NSPopUpMenuWindowLevel, NSScreen, NSStatusWindowLevel, NSTrackingArea, NSTrackingAreaOptions,
+    NSView, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate, NSWindowOrderingMode,
+    NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_quartz_core::{CALayer, CATransaction};
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGBitmapContextCreateImage, CGBitmapContextGetData, CGColorSpace,
     CGImage, CGImageAlphaInfo, CGImageByteOrderInfo,
@@ -47,6 +50,72 @@ fn push(ev: InputEvent) {
             bus.push(ev);
         }
     });
+}
+
+/// The current macOS keyboard layout as an xkb layout name (e.g. "de"), so the
+/// compositor's keymap can follow the Mac's keyboard automatically. Uses the
+/// Carbon Text Input Source API. Returns None for layouts we don't map.
+pub fn macos_keyboard_layout() -> Option<String> {
+    use std::ffi::CStr;
+    use std::os::raw::{c_char, c_void};
+
+    #[link(name = "Carbon", kind = "framework")]
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn TISCopyCurrentKeyboardLayoutInputSource() -> *mut c_void;
+        fn TISGetInputSourceProperty(source: *mut c_void, key: *const c_void) -> *const c_void;
+        static kTISPropertyInputSourceID: *const c_void;
+        fn CFRelease(cf: *const c_void);
+        fn CFStringGetCStringPtr(s: *const c_void, encoding: u32) -> *const c_char;
+        fn CFStringGetCString(s: *const c_void, buf: *mut c_char, size: isize, encoding: u32) -> bool;
+    }
+    const KCFSTRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+    // e.g. "com.apple.keylayout.German"
+    let id = unsafe {
+        let src = TISCopyCurrentKeyboardLayoutInputSource();
+        if src.is_null() {
+            return None;
+        }
+        let prop = TISGetInputSourceProperty(src, kTISPropertyInputSourceID);
+        if prop.is_null() {
+            CFRelease(src);
+            return None;
+        }
+        let s = {
+            let ptr = CFStringGetCStringPtr(prop, KCFSTRING_ENCODING_UTF8);
+            if !ptr.is_null() {
+                CStr::from_ptr(ptr).to_string_lossy().into_owned()
+            } else {
+                let mut buf = [0 as c_char; 256];
+                if CFStringGetCString(prop, buf.as_mut_ptr(), buf.len() as isize, KCFSTRING_ENCODING_UTF8) {
+                    CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
+                } else {
+                    String::new()
+                }
+            }
+        };
+        CFRelease(src);
+        s
+    };
+
+    let name = id.rsplit('.').next().unwrap_or("");
+    let xkb = match name {
+        n if n.starts_with("German") => "de",
+        n if n.starts_with("US") || n == "ABC" || n.starts_with("USInternational") => "us",
+        n if n.starts_with("British") => "gb",
+        n if n.starts_with("French") => "fr",
+        n if n.starts_with("Spanish") => "es",
+        n if n.starts_with("Italian") => "it",
+        n if n.starts_with("Swiss") => "ch",
+        n if n.starts_with("Dutch") => "nl",
+        n if n.starts_with("Portuguese") => "pt",
+        n if n.starts_with("Danish") => "dk",
+        n if n.starts_with("Norwegian") => "no",
+        n if n.starts_with("Swedish") => "se",
+        _ => return None,
+    };
+    Some(xkb.to_string())
 }
 
 // --- Clipboard bridge (NSPasteboard <-> the clipboard bridge) ---------------
@@ -148,6 +217,27 @@ define_class!(
             true
         }
 
+        // Apply the client-requested cursor (from wp_cursor_shape) over the view.
+        #[unsafe(method(resetCursorRects))]
+        fn reset_cursor_rects(&self) {
+            if let Some(cursor) = CURSOR.with(|c| c.borrow().clone()) {
+                self.addCursorRect_cursor(self.bounds(), &cursor);
+            }
+        }
+
+        // Keep the hosted root layer filling the view the instant the view resizes
+        // (e.g. during a native live resize), independent of buffer commits — so
+        // content tracks the window smoothly instead of jittering between frames.
+        #[unsafe(method(setFrameSize:))]
+        fn set_frame_size(&self, new_size: CGSize) {
+            let _: () = unsafe { msg_send![super(self), setFrameSize: new_size] };
+            if let Some(layer) = self.layer() {
+                without_animations(|| {
+                    layer.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), new_size));
+                });
+            }
+        }
+
         #[unsafe(method(updateTrackingAreas))]
         fn update_tracking_areas(&self) {
             let mtm = MainThreadMarker::from(self);
@@ -177,9 +267,11 @@ define_class!(
         }
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, ev: &NSEvent) {
-            // While an interactive move is active, drag the window instead of
-            // forwarding motion to the client.
-            if self.try_drag_window() {
+            // Interactive resize / move take precedence over forwarding motion.
+            if self.try_resize_window() {
+                return;
+            }
+            if self.try_drag_window(ev) {
                 return;
             }
             self.handle_motion(ev);
@@ -215,8 +307,9 @@ define_class!(
         }
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, ev: &NSEvent) {
-            // End any interactive window move.
+            // End any interactive window move / resize.
             DRAG.with(|d| *d.borrow_mut() = None);
+            RESIZE.with(|r| *r.borrow_mut() = None);
             self.handle_button(ev, false);
         }
         #[unsafe(method(rightMouseDown:))]
@@ -284,28 +377,26 @@ impl WaylandView {
         });
     }
 
-    /// If an interactive move is active for this window, move it to follow the
-    /// global mouse and return true (so motion isn't forwarded to the client).
-    fn try_drag_window(&self) -> bool {
+    /// If a move is pending for this window, hand off to the native window drag
+    /// (edge-snapping + drag-to-top maximize come for free), returning true so
+    /// motion isn't forwarded to the client.
+    fn try_drag_window(&self, ev: &NSEvent) -> bool {
         let id = self.ivars().window_id.get();
-        DRAG.with(|d| {
-            let borrow = d.borrow();
-            let Some(state) = borrow.as_ref() else {
-                return false;
-            };
-            if state.window_id != id {
-                return false;
+        let pending = DRAG.with(|d| {
+            if d.borrow().as_ref().map(|s| s.window_id) == Some(id) {
+                *d.borrow_mut() = None; // native drag takes over from here
+                true
+            } else {
+                false
             }
-            let mouse = NSEvent::mouseLocation();
-            let origin = CGPoint::new(
-                state.anchor_origin.x + (mouse.x - state.anchor_mouse.x),
-                state.anchor_origin.y + (mouse.y - state.anchor_mouse.y),
-            );
+        });
+        if pending {
             if let Some(window) = self.window() {
-                window.setFrameOrigin(origin);
+                window.performWindowDragWithEvent(ev);
             }
-            true
-        })
+            return true;
+        }
+        false
     }
 
     fn button(&self, ev: &NSEvent, pressed: bool) {
@@ -314,6 +405,50 @@ impl WaylandView {
             button: btn_code(ev.buttonNumber()),
             pressed,
         });
+    }
+
+    /// If an interactive resize is active for this window, resize it to follow the
+    /// mouse on the requested edges and return true (motion isn't forwarded).
+    fn try_resize_window(&self) -> bool {
+        let id = self.ivars().window_id.get();
+        let Some((edges, anchor_mouse, anchor_frame)) = RESIZE.with(|r| {
+            r.borrow()
+                .as_ref()
+                .filter(|s| s.window_id == id)
+                .map(|s| (s.edges, s.anchor_mouse, s.anchor_frame))
+        }) else {
+            return false;
+        };
+        // Compute the desired logical size from the drag and ask the *client* to
+        // repaint at that size. The NSWindow is not resized here — present_frame
+        // grows/shrinks it to match the buffer that comes back, keeping the
+        // corner opposite the dragged edge anchored. This avoids the window
+        // running ahead of the buffer (which stretches the content).
+        let mouse = NSEvent::mouseLocation();
+        let dx = mouse.x - anchor_mouse.x;
+        let dy = mouse.y - anchor_mouse.y; // macOS y grows upward
+        let mut w = anchor_frame.size.width;
+        let mut h = anchor_frame.size.height;
+        if edges & 4 != 0 {
+            w = anchor_frame.size.width - dx; // left
+        }
+        if edges & 8 != 0 {
+            w = anchor_frame.size.width + dx; // right
+        }
+        if edges & 1 != 0 {
+            h = anchor_frame.size.height + dy; // top
+        }
+        if edges & 2 != 0 {
+            h = anchor_frame.size.height - dy; // bottom
+        }
+        let w = w.max(120.0) as i32;
+        let h = h.max(80.0) as i32;
+        push(InputEvent::Resize {
+            window_id: id,
+            width: w,
+            height: h,
+        });
+        true
     }
 
     /// Motion, honoring an active popup grab (route everything to the popup).
@@ -334,29 +469,46 @@ impl WaylandView {
     /// Button, honoring an active popup grab: clicks inside the popup go to it;
     /// a click outside dismisses the menu.
     fn handle_button(&self, ev: &NSEvent, pressed: bool) {
+        let button = btn_code(ev.buttonNumber());
+        if !pressed {
+            // A release belongs to the surface that received the press (the implicit
+            // pointer grab): AppKit delivers mouseUp to the pressing view even if a
+            // popup mapped on top in between. Routing it here — instead of to the
+            // popup grab — stops the click that OPENED a menu from also selecting
+            // the item the popup happens to map under.
+            if let Some(w) = IMPLICIT_GRAB.with(|g| g.take()) {
+                push(InputEvent::PointerButton {
+                    window_id: w,
+                    button,
+                    pressed: false,
+                });
+            }
+            return;
+        }
         if let Some(gid) = grabbed() {
             if let Some((x, y, inside)) = global_in_window(gid) {
                 if inside {
-                    if pressed {
-                        // Ensure the popup has the pointer at the click location.
-                        push(InputEvent::PointerMotion {
-                            window_id: gid,
-                            x,
-                            y,
-                        });
-                    }
+                    // Ensure the popup has the pointer at the click location.
+                    push(InputEvent::PointerMotion {
+                        window_id: gid,
+                        x,
+                        y,
+                    });
                     push(InputEvent::PointerButton {
                         window_id: gid,
-                        button: btn_code(ev.buttonNumber()),
-                        pressed,
+                        button,
+                        pressed: true,
                     });
-                } else if pressed {
+                    IMPLICIT_GRAB.with(|g| g.set(Some(gid)));
+                } else {
                     push(InputEvent::PopupDismiss { window_id: gid });
+                    IMPLICIT_GRAB.with(|g| g.set(None));
                 }
             }
             return;
         }
-        self.button(ev, pressed);
+        self.button(ev, true);
+        IMPLICIT_GRAB.with(|g| g.set(Some(self.ivars().window_id.get())));
     }
 
     fn key(&self, ev: &NSEvent, pressed: bool) {
@@ -433,6 +585,60 @@ define_class!(
         fn can_become_main_window(&self) -> bool {
             true
         }
+
+        // The hook AppKit uses to keep a window's title bar below the menu bar.
+        // We extend it to also keep the window out of any docked-bar reserved
+        // zone, so a top bar behaves like the menu bar: the window can't be
+        // dragged or zoomed under it. Fullscreen windows are exempt (they cover
+        // bars intentionally).
+        #[unsafe(method(constrainFrameRect:toScreen:))]
+        fn constrain_frame_rect(&self, frame: CGRect, screen: Option<&NSScreen>) -> CGRect {
+            // Fullscreen windows (they cover bars) and layer windows/bars
+            // themselves (they own the reserved zone and sit at the screen edge)
+            // are positioned exactly by us — bypass AppKit's constraint entirely.
+            if let Some(view) = self.contentView() {
+                if let Ok(v) = view.downcast::<WaylandView>() {
+                    let id = v.ivars().window_id.get();
+                    let exempt = FULLSCREEN.with(|f| f.borrow().contains(&id))
+                        || LAYER_WINDOWS.with(|f| f.borrow().contains(&id));
+                    if exempt {
+                        return frame;
+                    }
+                }
+            }
+            let mut r: CGRect =
+                unsafe { msg_send![super(self), constrainFrameRect: frame, toScreen: screen] };
+            let (top, right, bottom, left) = crate::input::reserved_insets();
+            if top == 0 && right == 0 && bottom == 0 && left == 0 {
+                return r;
+            }
+            let visible = match screen {
+                Some(s) => s.visibleFrame(),
+                None => match self.screen() {
+                    Some(s) => s.visibleFrame(),
+                    None => return r,
+                },
+            };
+            let work = apply_reserved_insets(visible);
+            // macOS y grows upward. Clamp the top edge first (the menu-bar analog),
+            // then the other edges, but only nudge an edge inward when the window
+            // actually fits along that axis so a clamp never fights another.
+            let work_top = work.origin.y + work.size.height;
+            if r.origin.y + r.size.height > work_top {
+                r.origin.y = work_top - r.size.height;
+            }
+            if r.origin.y < work.origin.y && r.size.height <= work.size.height {
+                r.origin.y = work.origin.y;
+            }
+            let work_right = work.origin.x + work.size.width;
+            if r.origin.x + r.size.width > work_right {
+                r.origin.x = work_right - r.size.width;
+            }
+            if r.origin.x < work.origin.x && r.size.width <= work.size.width {
+                r.origin.x = work.origin.x;
+            }
+            r
+        }
     }
 );
 
@@ -471,6 +677,17 @@ define_class!(
     unsafe impl NSObjectProtocol for WinDelegate {}
 
     unsafe impl NSWindowDelegate for WinDelegate {
+        // When the window is deactivated (the user clicks another app/window), tell
+        // the client it lost focus. Without this, a client that dismisses menus on
+        // focus-out (e.g. Firefox's in-content app menu) keeps them open forever,
+        // because mouseExited only fires if the pointer physically leaves the view.
+        #[unsafe(method(windowDidResignKey:))]
+        fn window_did_resign_key(&self, _notif: &NSNotification) {
+            push(InputEvent::Focus {
+                window_id: self.ivars().window_id,
+                focused: false,
+            });
+        }
         #[unsafe(method(windowDidResize:))]
         fn window_did_resize(&self, notif: &NSNotification) {
             let Some(obj) = notif.object() else {
@@ -484,15 +701,37 @@ define_class!(
             };
             let size = view.frame().size;
             let (w, h) = (size.width as i32, size.height as i32);
+            // During an interactive edge resize, try_resize_window is the sole
+            // authority on the requested size and present_frame drives the frame
+            // from the buffer — so ignore these notifications (which present's own
+            // setFrame would otherwise echo back into a feedback loop).
+            let resizing = RESIZE
+                .with(|r| r.borrow().as_ref().map(|s| s.window_id))
+                == Some(self.ivars().window_id);
+            if resizing {
+                return;
+            }
             // Skip echoes of sizes we already asked the client to paint.
             if self.ivars().last.get() == (w, h) {
                 return;
             }
             self.ivars().last.set((w, h));
+            // Ask the client to paint its CONTENT (window geometry) at the window
+            // size minus its CSD shadow margin. A CSD client pads the buffer with
+            // the margin, so a plain `configure(window size)` would return a buffer
+            // that's `window + margin`, which present_frame would then grow the
+            // window to — a runaway loop. Subtracting the margin makes the returned
+            // buffer match the current window size, so it settles immediately.
+            let (mw, mh) = WINDOWS.with(|wm| {
+                wm.borrow()
+                    .get(&self.ivars().window_id)
+                    .map(|e| e.csd_margin)
+                    .unwrap_or((0, 0))
+            });
             push(InputEvent::Resize {
                 window_id: self.ivars().window_id,
-                width: w,
-                height: h,
+                width: (w - mw).max(1),
+                height: (h - mh).max(1),
             });
         }
     }
@@ -515,7 +754,17 @@ pub enum WinCmd {
         id: u32,
         width: i32,
         height: i32,
+        /// Logical (point) size from `wp_viewport.set_destination`, or (0,0) to
+        /// derive it from the buffer pixels and the output scale.
+        dst_w: i32,
+        dst_h: i32,
+        /// The client wants server-side decorations: give the window a native
+        /// macOS titlebar instead of a borderless (CSD) frame.
+        decorated: bool,
         title: String,
+        /// CSD window geometry `(x, y, w, h)` in logical points: the content bounds
+        /// within the buffer, excluding shadow margins. (0,0,0,0) = client set none.
+        geom: (i32, i32, i32, i32),
     },
     /// Present a new frame (a committed shm buffer) into a window.
     Frame {
@@ -523,13 +772,23 @@ pub enum WinCmd {
         width: i32,
         height: i32,
         stride: i32,
+        /// Logical (point) size from `wp_viewport.set_destination`, or (0,0) to
+        /// derive it from the buffer pixels and the output scale.
+        dst_w: i32,
+        dst_h: i32,
         /// Raw pixels, 32-bit, byte order B,G,R,X (Wayland XRGB8888/ARGB8888 LE).
         pixels: Vec<u8>,
+        /// CSD window geometry `(x, y, w, h)` in logical points (see Create). When
+        /// set, the window is sized to `(w,h)` and the buffer is cropped to the
+        /// content, so a shadow-padded buffer doesn't grow the window each resize.
+        geom: (i32, i32, i32, i32),
     },
     /// Update a window title.
     Title { id: u32, title: String },
     /// Begin an interactive drag of the window (from `xdg_toplevel.move`).
     StartMove { id: u32 },
+    /// Begin an interactive resize on the given edges (from `xdg_toplevel.resize`).
+    StartResize { id: u32, edges: u32 },
     /// Create a borderless popup window (menu/dropdown) positioned relative to
     /// its parent (logical/point coordinates, top-left of the parent surface).
     CreatePopup {
@@ -542,8 +801,69 @@ pub enum WinCmd {
     },
     /// Set (or clear) the popup that currently grabs the pointer.
     SetGrab { window: Option<u32> },
+    /// The focused client requested a cursor shape (wp_cursor_shape).
+    SetCursor { shape: u32 },
+    /// The client set a custom cursor from a surface buffer (wl_pointer.set_cursor).
+    SetCursorImage {
+        width: i32,
+        height: i32,
+        stride: i32,
+        /// Hotspot in surface-local (logical) coordinates.
+        hotspot_x: i32,
+        hotspot_y: i32,
+        pixels: Vec<u8>,
+    },
+    /// Hide the cursor (wl_pointer.set_cursor with a null surface).
+    HideCursor,
+    /// Composite a subsurface as a sublayer of a window. `sub_id` keys the sublayer;
+    /// `x`,`y` are the position within the parent (logical points, top-left origin).
+    SubFrame {
+        window_id: u32,
+        sub_id: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        stride: i32,
+        dst_w: i32,
+        dst_h: i32,
+        pixels: Vec<u8>,
+    },
+    /// Remove a subsurface's sublayer.
+    SubDestroy { window_id: u32, sub_id: u32 },
+    /// Maximize / unmaximize a window (xdg_toplevel.[un]set_maximized).
+    Maximize { id: u32, on: bool },
+    /// Fullscreen / unfullscreen a window.
+    Fullscreen { id: u32, on: bool },
+    /// Minimize a window.
+    Minimize { id: u32 },
+    /// Set the window's minimum content size (logical points).
+    SetMinSize { id: u32, width: i32, height: i32 },
+    /// Set the window's maximum content size (0 = unlimited).
+    SetMaxSize { id: u32, width: i32, height: i32 },
+    /// Raise and focus a window (xdg_activation_v1.activate).
+    Activate { id: u32 },
+    /// Mark a window as a modal dialog / clear that mark (xdg_dialog_v1).
+    /// Modal dialogs float above their normal-level windows.
+    SetModal { id: u32, modal: bool },
     /// Destroy a window.
     Destroy { id: u32 },
+    /// Create a docked bar/panel (wlr-layer-shell): a borderless floating window
+    /// anchored to a screen edge. `anchor` bitfield: top=1, bottom=2, left=4,
+    /// right=8. `width`/`height` are physical buffer pixels.
+    CreateLayer {
+        id: u32,
+        width: i32,
+        height: i32,
+        anchor: u32,
+        margin_top: i32,
+        margin_right: i32,
+        margin_bottom: i32,
+        margin_left: i32,
+        /// The surface wants keyboard input (e.g. a launcher): make the window key
+        /// so macOS routes keystrokes to it. A plain bar (false) only orders front.
+        keyboard: bool,
+    },
 }
 
 struct WinEntry {
@@ -554,12 +874,27 @@ struct WinEntry {
     _delegate: Option<Retained<WinDelegate>>,
     cur_w: i32,
     cur_h: i32,
+    /// Server-decorated (native titlebar): the window size is macOS/user-driven,
+    /// so present_frame must not resize it from the (lagging) buffer — doing so
+    /// creates a configure↔resize feedback loop that oscillates between two sizes.
+    decorated: bool,
+    /// CSD shadow-margin size (logical points): buffer minus the client's window
+    /// geometry. A resize configure asks for (window size − margin) so a client
+    /// that pads its buffer with shadows doesn't grow the window each round-trip.
+    csd_margin: (i32, i32),
+    /// Subsurface sublayers keyed by sub_id (see WinCmd::SubFrame).
+    sublayers: HashMap<u32, Retained<CALayer>>,
 }
 
 struct DragState {
     window_id: u32,
+}
+
+struct ResizeState {
+    window_id: u32,
+    edges: u32, // xdg_toplevel ResizeEdge bitmask: top=1 bottom=2 left=4 right=8
     anchor_mouse: CGPoint,
-    anchor_origin: CGPoint,
+    anchor_frame: CGRect,
 }
 
 thread_local! {
@@ -568,14 +903,172 @@ thread_local! {
     // round-trips through the container, so we can't use the live NSEvent — we
     // anchor here and follow the global mouse ourselves.
     static DRAG: RefCell<Option<DragState>> = const { RefCell::new(None) };
+    // Active interactive resize (from xdg_toplevel.resize).
+    static RESIZE: RefCell<Option<ResizeState>> = const { RefCell::new(None) };
     // Window id of a popup that has grabbed the pointer (from xdg_popup.grab).
     // While set, all pointer input routes to that popup (menus), and a click
     // outside it dismisses the menu.
     static GRAB: Cell<Option<u32>> = const { Cell::new(None) };
+    // Implicit pointer grab: the window that received the current held button-press.
+    // Its matching release is delivered here regardless of any popup grab, so the
+    // click that OPENS a menu doesn't also select the item the popup maps under.
+    static IMPLICIT_GRAB: Cell<Option<u32>> = const { Cell::new(None) };
+    // The cursor the focused client last requested (via wp_cursor_shape); applied
+    // through the view's cursor rects.
+    static CURSOR: RefCell<Option<Retained<NSCursor>>> = const { RefCell::new(None) };
+    // Pre-maximize/fullscreen frames, so unmaximize/unfullscreen can restore them.
+    static SAVED_FRAMES: RefCell<HashMap<u32, CGRect>> = RefCell::new(HashMap::new());
+    // Windows currently in fullscreen: they intentionally cover docked bars, so
+    // constrainFrameRect: must not clamp them into the reserved work area.
+    static FULLSCREEN: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
+    // Layer-shell windows (docked bars, launchers). They are positioned exactly by
+    // us (a bar defines the reserved zone and sits at the very screen edge), so
+    // constrainFrameRect: must leave them alone — otherwise a bar is pushed out of
+    // its own exclusive zone.
+    static LAYER_WINDOWS: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
+}
+
+/// Fill the window's screen (visible area for maximize, whole screen for
+/// fullscreen), or restore its saved frame. Resizing triggers `windowDidResize`,
+/// which sends the client a configure at the new size.
+fn set_window_fill(id: u32, on: bool, fullscreen: bool) {
+    WINDOWS.with(|w| {
+        let map = w.borrow();
+        let Some(e) = map.get(&id) else { return };
+        if on {
+            SAVED_FRAMES.with(|s| {
+                s.borrow_mut().entry(id).or_insert_with(|| e.window.frame());
+            });
+            // Track fullscreen so constrainFrameRect: lets it cover docked bars.
+            FULLSCREEN.with(|f| {
+                if fullscreen {
+                    f.borrow_mut().insert(id);
+                } else {
+                    f.borrow_mut().remove(&id);
+                }
+            });
+            if let Some(screen) = e.window.screen() {
+                let target = if fullscreen {
+                    // Fullscreen intentionally covers everything, bars included.
+                    screen.frame()
+                } else {
+                    // Maximize fills the work area minus any docked bars' reserved
+                    // zones, so a maximized window doesn't sit under a bar.
+                    apply_reserved_insets(screen.visibleFrame())
+                };
+                e.window.setFrame_display(target, true);
+            }
+        } else {
+            FULLSCREEN.with(|f| {
+                f.borrow_mut().remove(&id);
+            });
+            if let Some(saved) = SAVED_FRAMES.with(|s| s.borrow_mut().remove(&id)) {
+                e.window.setFrame_display(saved, true);
+            }
+        }
+    });
+}
+
+/// Center a newly-created window within the work area (visible frame minus the
+/// reserved bar zones), clamping so its top never crosses under a top bar.
+fn place_in_work_area(mtm: MainThreadMarker, window: &NSWindow, lw: f64, lh: f64) {
+    let Some(screen) = window.screen().or_else(|| NSScreen::mainScreen(mtm)) else {
+        window.center();
+        return;
+    };
+    let work = apply_reserved_insets(screen.visibleFrame());
+    let x = work.origin.x + (work.size.width - lw).max(0.0) / 2.0;
+    let mut y = work.origin.y + (work.size.height - lh).max(0.0) / 2.0;
+    // macOS y grows upward; keep the window's top edge inside the work area.
+    let work_top = work.origin.y + work.size.height;
+    if y + lh > work_top {
+        y = work_top - lh;
+    }
+    window.setFrameOrigin(CGPoint::new(x, y));
+}
+
+/// Shrink a screen rect by the work-area insets reserved by docked bars
+/// (layer-shell exclusive zones). macOS y is bottom-up, so a top inset trims the
+/// height and a bottom inset also raises the origin.
+fn apply_reserved_insets(rect: CGRect) -> CGRect {
+    let (top, right, bottom, left) = crate::input::reserved_insets();
+    CGRect::new(
+        CGPoint::new(rect.origin.x + left as f64, rect.origin.y + bottom as f64),
+        CGSize::new(
+            (rect.size.width - (left + right) as f64).max(1.0),
+            (rect.size.height - (top + bottom) as f64).max(1.0),
+        ),
+    )
+}
+
+/// Map a wp_cursor_shape shape id to the closest NSCursor.
+#[allow(deprecated)] // resize*Cursor are deprecated but the replacements are 15.0+
+fn map_cursor(shape: u32) -> Retained<NSCursor> {
+    match shape {
+        2 => NSCursor::contextualMenuCursor(),        // context_menu
+        4 => NSCursor::pointingHandCursor(),          // pointer
+        8 => NSCursor::crosshairCursor(),             // crosshair
+        9 | 10 => NSCursor::IBeamCursor(),            // text / vertical_text
+        12 => NSCursor::dragCopyCursor(),             // copy
+        14 | 15 => NSCursor::operationNotAllowedCursor(), // no_drop / not_allowed
+        16 => NSCursor::openHandCursor(),             // grab
+        17 => NSCursor::closedHandCursor(),           // grabbing
+        18 | 25 | 26 | 30 => NSCursor::resizeLeftRightCursor(), // e/w/ew/col resize
+        19 | 22 | 27 | 31 => NSCursor::resizeUpDownCursor(),    // n/s/ns/row resize
+        _ => NSCursor::arrowCursor(),
+    }
+}
+
+/// Re-run every view's `resetCursorRects` so a newly set CURSOR takes effect.
+fn refresh_cursor_rects() {
+    WINDOWS.with(|w| {
+        for e in w.borrow().values() {
+            e.window.invalidateCursorRectsForView(&e.view);
+        }
+    });
+}
+
+/// Build an `NSCursor` from a client cursor-surface buffer. The buffer is in
+/// physical pixels; the image is shown at logical points (÷scale) and the hotspot
+/// is already in surface-local (logical) coordinates.
+fn make_cursor(
+    mtm: MainThreadMarker,
+    width: i32,
+    height: i32,
+    stride: i32,
+    hotspot_x: i32,
+    hotspot_y: i32,
+    pixels: &[u8],
+) -> Option<Retained<NSCursor>> {
+    let image = make_cgimage(width, height, stride, pixels)?;
+    let scale = crate::input::scale() as f64;
+    let size = CGSize::new(width as f64 / scale, height as f64 / scale);
+    let ns_image = NSImage::initWithCGImage_size(mtm.alloc::<NSImage>(), &image, size);
+    let hotspot = CGPoint::new(hotspot_x as f64, hotspot_y as f64);
+    Some(NSCursor::initWithImage_hotSpot(
+        mtm.alloc::<NSCursor>(),
+        &ns_image,
+        hotspot,
+    ))
+}
+
+/// A fully transparent 1x1 cursor, used to hide the pointer.
+fn empty_cursor(mtm: MainThreadMarker) -> Retained<NSCursor> {
+    let pixels = [0u8; 4]; // transparent BGRA
+    make_cursor(mtm, 1, 1, 4, 0, 0, &pixels).unwrap_or_else(NSCursor::arrowCursor)
 }
 
 fn grabbed() -> Option<u32> {
-    GRAB.with(|g| g.get())
+    let g = GRAB.with(|g| g.get())?;
+    // Self-heal: if the grabbing popup's window no longer exists (e.g. a menu that
+    // was abandoned before it painted), clear the grab instead of swallowing all
+    // input forever.
+    let exists = WINDOWS.with(|w| w.borrow().contains_key(&g));
+    if !exists {
+        GRAB.with(|c| c.set(None));
+        return None;
+    }
+    Some(g)
 }
 
 /// macOS NSEvent button number -> evdev button code.
@@ -629,8 +1122,29 @@ fn restore_focus_under_cursor() {
     }
 }
 
+/// Test hook: when a sink is installed, `post` diverts every `WinCmd` into it
+/// instead of dispatching to the AppKit main queue. This is the seam headless
+/// tests use to observe the protocol layer's output without touching AppKit.
+/// Production behavior is unchanged when no sink is set.
+static POST_SINK: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::mpsc::Sender<WinCmd>>>> =
+    std::sync::OnceLock::new();
+
+/// Install a channel that captures every `WinCmd` passed to `post`.
+/// Test-only seam; unused in the shipped binary.
+#[allow(dead_code)]
+pub fn set_post_sink(tx: std::sync::mpsc::Sender<WinCmd>) {
+    let cell = POST_SINK.get_or_init(|| std::sync::Mutex::new(None));
+    *cell.lock().unwrap() = Some(tx);
+}
+
 /// Enqueue a window command onto the AppKit main thread.
 pub fn post(cmd: WinCmd) {
+    if let Some(m) = POST_SINK.get() {
+        if let Some(tx) = m.lock().unwrap().as_ref() {
+            let _ = tx.send(cmd);
+            return;
+        }
+    }
     DispatchQueue::main().exec_async(move || handle(cmd));
 }
 
@@ -642,15 +1156,32 @@ fn handle(cmd: WinCmd) {
             id,
             width,
             height,
+            dst_w,
+            dst_h,
+            decorated,
             title,
-        } => create_window(mtm, id, width.max(1), height.max(1), &title),
+            geom,
+        } => create_window(
+            mtm,
+            id,
+            width.max(1),
+            height.max(1),
+            dst_w,
+            dst_h,
+            decorated,
+            &title,
+            geom,
+        ),
         WinCmd::Frame {
             id,
             width,
             height,
             stride,
+            dst_w,
+            dst_h,
             pixels,
-        } => present_frame(mtm, id, width, height, stride, &pixels),
+            geom,
+        } => present_frame(mtm, id, width, height, stride, dst_w, dst_h, &pixels, geom),
         WinCmd::Title { id, title } => {
             WINDOWS.with(|w| {
                 if let Some(e) = w.borrow().get(&id) {
@@ -659,17 +1190,19 @@ fn handle(cmd: WinCmd) {
             });
         }
         WinCmd::StartMove { id } => {
-            // Anchor the drag at the current window origin + global mouse; the
-            // view's mouseDragged handler moves the window to follow.
+            // Mark a move pending; the view's next mouseDragged hands off to the
+            // native window drag (which gives edge-snapping + drag-to-top maximize).
+            DRAG.with(|d| *d.borrow_mut() = Some(DragState { window_id: id }));
+        }
+        WinCmd::StartResize { id, edges } => {
             WINDOWS.with(|w| {
                 if let Some(e) = w.borrow().get(&id) {
-                    let anchor_origin = e.window.frame().origin;
-                    let anchor_mouse = NSEvent::mouseLocation();
-                    DRAG.with(|d| {
-                        *d.borrow_mut() = Some(DragState {
+                    RESIZE.with(|r| {
+                        *r.borrow_mut() = Some(ResizeState {
                             window_id: id,
-                            anchor_mouse,
-                            anchor_origin,
+                            edges,
+                            anchor_mouse: NSEvent::mouseLocation(),
+                            anchor_frame: e.window.frame(),
                         });
                     });
                 }
@@ -690,6 +1223,108 @@ fn handle(cmd: WinCmd) {
                 restore_focus_under_cursor();
             }
         }
+        WinCmd::SetCursor { shape } => {
+            CURSOR.with(|c| *c.borrow_mut() = Some(map_cursor(shape)));
+            refresh_cursor_rects();
+        }
+        WinCmd::SetCursorImage {
+            width,
+            height,
+            stride,
+            hotspot_x,
+            hotspot_y,
+            pixels,
+        } => {
+            if let Some(cursor) =
+                make_cursor(mtm, width, height, stride, hotspot_x, hotspot_y, &pixels)
+            {
+                CURSOR.with(|c| *c.borrow_mut() = Some(cursor));
+                refresh_cursor_rects();
+            }
+        }
+        WinCmd::HideCursor => {
+            CURSOR.with(|c| *c.borrow_mut() = Some(empty_cursor(mtm)));
+            refresh_cursor_rects();
+        }
+        WinCmd::SubFrame {
+            window_id,
+            sub_id,
+            x,
+            y,
+            width,
+            height,
+            stride,
+            dst_w,
+            dst_h,
+            pixels,
+        } => present_subframe(
+            window_id, sub_id, x, y, width, height, stride, dst_w, dst_h, &pixels,
+        ),
+        WinCmd::SubDestroy { window_id, sub_id } => {
+            WINDOWS.with(|w| {
+                if let Some(entry) = w.borrow_mut().get_mut(&window_id) {
+                    if let Some(layer) = entry.sublayers.remove(&sub_id) {
+                        layer.removeFromSuperlayer();
+                    }
+                }
+            });
+        }
+        WinCmd::Maximize { id, on } => set_window_fill(id, on, false),
+        WinCmd::Fullscreen { id, on } => set_window_fill(id, on, true),
+        WinCmd::Minimize { id } => {
+            WINDOWS.with(|w| {
+                if let Some(e) = w.borrow().get(&id) {
+                    e.window.miniaturize(None);
+                }
+            });
+        }
+        WinCmd::SetMinSize { id, width, height } => {
+            let s = crate::input::scale();
+            WINDOWS.with(|w| {
+                if let Some(e) = w.borrow().get(&id) {
+                    e.window.setContentMinSize(CGSize::new(
+                        (width / s).max(1) as f64,
+                        (height / s).max(1) as f64,
+                    ));
+                }
+            });
+        }
+        WinCmd::SetMaxSize { id, width, height } => {
+            let s = crate::input::scale();
+            // 0 means "no limit"; use a very large value.
+            let big = 1_000_000.0;
+            let mw = if width > 0 { (width / s) as f64 } else { big };
+            let mh = if height > 0 { (height / s) as f64 } else { big };
+            WINDOWS.with(|w| {
+                if let Some(e) = w.borrow().get(&id) {
+                    e.window.setContentMaxSize(CGSize::new(mw, mh));
+                }
+            });
+        }
+        WinCmd::Activate { id } => {
+            WINDOWS.with(|w| {
+                if let Some(e) = w.borrow().get(&id) {
+                    let app = NSApplication::sharedApplication(mtm);
+                    #[allow(deprecated)]
+                    app.activateIgnoringOtherApps(true);
+                    e.window.makeKeyAndOrderFront(None);
+                }
+            });
+        }
+        WinCmd::SetModal { id, modal } => {
+            WINDOWS.with(|w| {
+                if let Some(e) = w.borrow().get(&id) {
+                    // A modal dialog floats above ordinary windows; unsetting
+                    // returns it to the normal level. We deliberately do not run
+                    // a blocking modal session (that would freeze the compositor).
+                    e.window.setLevel(if modal {
+                        NSModalPanelWindowLevel
+                    } else {
+                        NSNormalWindowLevel
+                    });
+                }
+            });
+        }
         WinCmd::Destroy { id } => {
             // If the grabbing popup is going away, clear the grab.
             let grab_ended = GRAB.with(|g| {
@@ -705,48 +1340,128 @@ fn handle(cmd: WinCmd) {
                     e.window.close();
                 }
             });
+            LAYER_WINDOWS.with(|f| {
+                f.borrow_mut().remove(&id);
+            });
+            FULLSCREEN.with(|f| {
+                f.borrow_mut().remove(&id);
+            });
+            SAVED_FRAMES.with(|s| {
+                s.borrow_mut().remove(&id);
+            });
             if grab_ended {
                 restore_focus_under_cursor();
             }
         }
+        WinCmd::CreateLayer {
+            id,
+            width,
+            height,
+            anchor,
+            margin_top,
+            margin_right,
+            margin_bottom,
+            margin_left,
+            keyboard,
+        } => create_layer_window(
+            mtm,
+            id,
+            width.max(1),
+            height.max(1),
+            anchor,
+            (margin_top, margin_right, margin_bottom, margin_left),
+            keyboard,
+        ),
     }
 }
 
-fn create_window(mtm: MainThreadMarker, id: u32, width: i32, height: i32, title: &str) {
-    // The buffer is in physical pixels; the window/view are in logical points.
+/// Logical (point) size of a window: the `wp_viewport` destination if the client
+/// set one, else the physical buffer size divided by the output scale. This is the
+/// full buffer (including any CSD shadow margins), so content is never clipped.
+fn logical_size(width: i32, height: i32, dst_w: i32, dst_h: i32, scale: i32) -> (f64, f64) {
+    if dst_w > 0 && dst_h > 0 {
+        (dst_w as f64, dst_h as f64)
+    } else {
+        ((width / scale).max(1) as f64, (height / scale).max(1) as f64)
+    }
+}
+
+/// The CSD shadow-margin size (logical points) — the buffer minus the client's
+/// window geometry. Used so a resize configure asks for the *content* size, not the
+/// padded buffer size; otherwise the window grows by the margin each round-trip.
+/// (0,0) when the client set no geometry or is using a viewport.
+fn csd_margin(width: i32, height: i32, dst_w: i32, dst_h: i32, geom: (i32, i32, i32, i32), scale: i32) -> (i32, i32) {
+    let (_, _, gw, gh) = geom;
+    if dst_w > 0 || dst_h > 0 || gw <= 0 || gh <= 0 {
+        return (0, 0);
+    }
+    let (bw, bh) = ((width / scale).max(1), (height / scale).max(1));
+    ((bw - gw).max(0), (bh - gh).max(0))
+}
+
+fn create_window(
+    mtm: MainThreadMarker,
+    id: u32,
+    width: i32,
+    height: i32,
+    dst_w: i32,
+    dst_h: i32,
+    decorated: bool,
+    title: &str,
+    geom: (i32, i32, i32, i32),
+) {
+    // The window/view are in logical points. Prefer an explicit viewport
+    // destination; otherwise convert the physical buffer size by the output scale.
     let scale = crate::input::scale();
-    let lw = (width / scale).max(1) as f64;
-    let lh = (height / scale).max(1) as f64;
+    let (lw, lh) = logical_size(width, height, dst_w, dst_h, scale);
+    let margin = csd_margin(width, height, dst_w, dst_h, geom, scale);
     let rect = CGRect::new(CGPoint::new(120.0, 120.0), CGSize::new(lw, lh));
-    // Fully borderless: GTK draws its own title bar, rounded corners and shadow,
-    // so any native chrome (even a hidden titlebar) would show its own rounded
-    // frame in GTK's transparent margins. `Resizable` still allows edge resizing.
-    let style = NSWindowStyleMask::Borderless | NSWindowStyleMask::Resizable;
+    // Server-side decorations: give the window a native macOS titlebar (title +
+    // traffic-light buttons). CSD toolkits (GTK/libadwaita) instead draw their own
+    // titlebar, rounded corners and shadow into the buffer's transparent margins,
+    // so those windows are fully borderless (native chrome would double up).
+    let style = if decorated {
+        NSWindowStyleMask::Titled
+            | NSWindowStyleMask::Closable
+            | NSWindowStyleMask::Miniaturizable
+            | NSWindowStyleMask::Resizable
+    } else {
+        NSWindowStyleMask::Borderless | NSWindowStyleMask::Resizable
+    };
     let window = WaylandWindow::new(mtm, rect, style);
     // We keep the NSWindow alive via a `Retained` in WINDOWS; `close()` must not
     // also release it, or we'd over-release and crash.
     unsafe { window.setReleasedWhenClosed(false) };
     window.setTitle(&NSString::from_str(title));
-    // No native shadow — GTK's CSD already draws one into the buffer margins.
-    window.setHasShadow(false);
+    // A decorated window keeps its native shadow; a borderless CSD window draws its
+    // own shadow into the buffer margins, so suppress the native one there.
+    window.setHasShadow(decorated);
 
     let view = WaylandView::new(
         mtm,
         id,
         CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(lw, lh)),
     );
+    // Layer-HOSTING (own layer set before wantsLayer), not layer-backed: we add
+    // subsurface sublayers ourselves, and AppKit's auto-managed backing layer
+    // would not composite manually-added sublayers (they'd stay invisible).
+    let root = CALayer::new();
+    root.setContentsScale(scale as f64);
+    root.setOpaque(false);
+    // A hosted layer isn't auto-sized by AppKit; give it the view's bounds (kept
+    // in sync in present_frame) so the main contents fill it.
+    root.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(lw, lh)));
+    let cg = NSColor::clearColor().CGColor();
+    root.setBackgroundColor(Some(&cg));
+    view.setLayer(Some(&root));
     view.setWantsLayer(true);
-    // Toolkit apps (GTK) use client-side decorations with translucent shadow
-    // margins, so present the window fully transparent behind the buffer —
-    // otherwise the system window background shows through those margins.
-    window.setOpaque(false);
-    window.setBackgroundColor(Some(&NSColor::clearColor()));
-    if let Some(layer) = view.layer() {
-        layer.setOpaque(false);
-        // The layer contents are a physical-pixel image; map to logical points.
-        layer.setContentsScale(scale as f64);
-        let cg = NSColor::clearColor().CGColor();
-        layer.setBackgroundColor(Some(&cg));
+    // CSD toolkits (GTK) use translucent shadow margins, so present the window
+    // transparent behind the buffer — otherwise the system background shows
+    // through those margins. A server-decorated window's content fills the frame
+    // opaquely, so keep it opaque there.
+    window.setOpaque(decorated);
+    if !decorated {
+        window.setBackgroundColor(Some(&NSColor::clearColor()));
     }
 
     window.setAcceptsMouseMovedEvents(true);
@@ -756,7 +1471,10 @@ fn create_window(mtm: MainThreadMarker, id: u32, width: i32, height: i32, title:
     let delegate = WinDelegate::new(mtm, id, lw as i32, lh as i32);
     window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
-    window.center();
+    // Place the window inside the work area (visible frame minus any docked-bar
+    // reserved zones) so it doesn't spawn under a bar. macOS's own `center()`
+    // ignores our reserved zones; you can still drag a window under the bar.
+    place_in_work_area(mtm, &window, lw, lh);
     window.makeKeyAndOrderFront(None);
     window.makeFirstResponder(Some(&view));
 
@@ -773,12 +1491,133 @@ fn create_window(mtm: MainThreadMarker, id: u32, width: i32, height: i32, title:
                 window,
                 view,
                 _delegate: Some(delegate),
-                cur_w: width,
-                cur_h: height,
+                cur_w: lw as i32,
+                cur_h: lh as i32,
+                decorated,
+                csd_margin: margin,
+                sublayers: HashMap::new(),
             },
         );
     });
-    eprintln!("[mac] created NSWindow for toplevel {id} ({width}x{height})");
+    eprintln!(
+        "[mac] created NSWindow for toplevel {id} ({lw}x{lh} pts, buffer {width}x{height})"
+    );
+}
+
+/// Create a docked bar/panel (wlr-layer-shell): a borderless, floating window
+/// anchored to a screen edge per the anchor bitfield (top=1, bottom=2, left=4,
+/// right=8) and margins. It floats above normal windows. A plain bar doesn't take
+/// key focus; a keyboard-interactive surface (a launcher) is made key so macOS
+/// routes keystrokes to it.
+fn create_layer_window(
+    mtm: MainThreadMarker,
+    id: u32,
+    width: i32,
+    height: i32,
+    anchor: u32,
+    margins: (i32, i32, i32, i32), // (top, right, bottom, left)
+    keyboard: bool,
+) {
+    let scale = crate::input::scale();
+    let lw = (width / scale).max(1) as f64;
+    let lh = (height / scale).max(1) as f64;
+    let (mt, mr, mb, ml) = (
+        margins.0 as f64,
+        margins.1 as f64,
+        margins.2 as f64,
+        margins.3 as f64,
+    );
+    let (top, bottom, left, right) = (
+        anchor & 1 != 0,
+        anchor & 2 != 0,
+        anchor & 4 != 0,
+        anchor & 8 != 0,
+    );
+
+    // Use the visible frame (excludes the macOS menu bar and Dock) so a top bar
+    // docks just below the menu bar and a bottom bar above the Dock.
+    let sf = NSScreen::mainScreen(mtm)
+        .map(|s| s.visibleFrame())
+        .unwrap_or_else(|| CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(lw, lh)));
+    let (sx, sy, sw, sh) = (sf.origin.x, sf.origin.y, sf.size.width, sf.size.height);
+
+    let x = if left && !right {
+        sx + ml
+    } else if right && !left {
+        sx + sw - lw - mr
+    } else {
+        sx + (sw - lw) / 2.0 // spanning or unspecified -> centered
+    };
+    // macOS y grows upward; the screen's top edge is at sy + sh.
+    let y = if top && !bottom {
+        sy + sh - lh - mt
+    } else if bottom && !top {
+        sy + mb
+    } else {
+        sy + (sh - lh) / 2.0
+    };
+
+    // A layer window is positioned exactly by us; exempt it from the reserved-zone
+    // constraint (a bar owns that zone and must sit at the screen edge).
+    LAYER_WINDOWS.with(|f| {
+        f.borrow_mut().insert(id);
+    });
+    let rect = CGRect::new(CGPoint::new(x, y), CGSize::new(lw, lh));
+    let window = WaylandWindow::new(mtm, rect, NSWindowStyleMask::Borderless);
+    unsafe { window.setReleasedWhenClosed(false) };
+    window.setHasShadow(false);
+    window.setOpaque(false);
+    window.setBackgroundColor(Some(&NSColor::clearColor()));
+    // Float above normal windows like a bar/dock, and show on every Space
+    // (including over fullscreen apps) so it behaves like a real menu/dock bar.
+    window.setLevel(NSStatusWindowLevel);
+    window.setCollectionBehavior(
+        NSWindowCollectionBehavior::CanJoinAllSpaces | NSWindowCollectionBehavior::Stationary,
+    );
+
+    let view = WaylandView::new(
+        mtm,
+        id,
+        CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(lw, lh)),
+    );
+    let root = CALayer::new();
+    root.setContentsScale(scale as f64);
+    root.setOpaque(false);
+    root.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(lw, lh)));
+    view.setLayer(Some(&root));
+    view.setWantsLayer(true);
+    window.setAcceptsMouseMovedEvents(true);
+    window.setContentView(Some(&view));
+    if keyboard {
+        // A launcher (fuzzel) needs keystrokes: make it key + first responder and
+        // activate the app so macOS routes keyDown to the view (which forwards to
+        // the focused Wayland surface).
+        window.makeKeyAndOrderFront(None);
+        window.makeFirstResponder(Some(&view));
+        let app = NSApplication::sharedApplication(mtm);
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+    } else {
+        // A plain bar shouldn't steal focus from apps.
+        window.orderFront(None);
+    }
+
+    WINDOWS.with(|w| {
+        w.borrow_mut().insert(
+            id,
+            WinEntry {
+                window,
+                view,
+                _delegate: None,
+                cur_w: lw as i32,
+                cur_h: lh as i32,
+                decorated: false,
+                csd_margin: (0, 0),
+                sublayers: HashMap::new(),
+            },
+        );
+    });
+    eprintln!("[mac] created layer window {id} ({lw}x{lh} pts) anchor={anchor}");
 }
 
 /// Create a borderless popup window (menu/dropdown) as a child of its parent,
@@ -797,17 +1636,36 @@ fn create_popup(
     let lh = (height / scale).max(1) as f64;
 
     // Screen origin from the parent (macOS frames are bottom-left origin).
-    let origin = WINDOWS
+    let (mut origin, parent_screen) = WINDOWS
         .with(|w| {
             w.borrow().get(&parent_id).map(|p| {
                 let f = p.window.frame();
-                CGPoint::new(
-                    f.origin.x + x as f64,
-                    (f.origin.y + f.size.height) - y as f64 - lh,
+                (
+                    CGPoint::new(
+                        f.origin.x + x as f64,
+                        (f.origin.y + f.size.height) - y as f64 - lh,
+                    ),
+                    p.window.screen(),
                 )
             })
         })
-        .unwrap_or_else(|| CGPoint::new(200.0, 200.0));
+        .unwrap_or((CGPoint::new(200.0, 200.0), None));
+
+    // Constraint adjustment (slide): keep the whole popup on-screen. A client's
+    // xdg_positioner asks the compositor to flip/slide a menu that would fall off an
+    // edge; we slide it back into the visible area. Without this a tall menu (e.g.
+    // Firefox's hamburger) lands partly off the top edge — clipped, and its dismiss
+    // hit-test misses because the window isn't where the user sees it.
+    let screen = parent_screen.or_else(|| NSScreen::mainScreen(mtm));
+    if let Some(s) = screen {
+        let vf = s.visibleFrame();
+        let max_x = vf.origin.x + vf.size.width - lw;
+        let max_y = vf.origin.y + vf.size.height - lh;
+        // Clamp to [min, max]; if the popup is larger than the work area, pin to the
+        // min edge (top-left) so its start is visible rather than its end.
+        origin.x = origin.x.min(max_x).max(vf.origin.x);
+        origin.y = origin.y.min(max_y).max(vf.origin.y);
+    }
 
     // Use the WaylandWindow subclass so the popup can become key (menu keyboard
     // navigation) and receive mouse input consistently.
@@ -852,6 +1710,9 @@ fn create_popup(
                 _delegate: None,
                 cur_w: width,
                 cur_h: height,
+                decorated: false,
+                csd_margin: (0, 0),
+                sublayers: HashMap::new(),
             },
         );
     });
@@ -887,36 +1748,152 @@ fn present_frame(
     width: i32,
     height: i32,
     stride: i32,
+    dst_w: i32,
+    dst_h: i32,
     pixels: &[u8],
+    geom: (i32, i32, i32, i32),
 ) {
     let Some(image) = make_cgimage(width, height, stride, pixels) else {
         eprintln!("[mac] failed to build CGImage for {id}");
         return;
     };
+    let scale = crate::input::scale();
+    let margin = csd_margin(width, height, dst_w, dst_h, geom, scale);
 
     WINDOWS.with(|w| {
         let mut map = w.borrow_mut();
         let Some(entry) = map.get_mut(&id) else { return };
+        // Track the current CSD shadow margin so windowDidResize can subtract it
+        // from the size it asks the client to paint (avoids the resize growth loop).
+        entry.csd_margin = margin;
 
-        // Resize the window whenever the buffer dimensions change. The buffer is
-        // physical pixels; the window content size is logical points.
-        if entry.cur_w != width || entry.cur_h != height {
-            let scale = crate::input::scale();
-            let lw = (width / scale).max(1) as f64;
-            let lh = (height / scale).max(1) as f64;
-            entry.window.setContentSize(CGSize::new(lw, lh));
-            entry.cur_w = width;
-            entry.cur_h = height;
+        // Resize the window whenever its logical size changes. The image is built
+        // from the raw buffer (physical px) and scaled to fill; the window itself
+        // is sized in points, from the viewport destination or buffer/scale.
+        let (lw, lh) = logical_size(width, height, dst_w, dst_h, scale);
+        // During a native live resize (a decorated window's edge drag) macOS owns
+        // the window size — following the mouse — while the client repaints via the
+        // configure we sent in windowDidResize. Setting the size from the buffer
+        // here would fight that and make the window flicker between sizes.
+        // A server-decorated window's size is macOS/user-authoritative: the client
+        // renders to match the configure we send on windowDidResize, and its buffer
+        // lags a frame — so resizing the window from the buffer here would bounce it
+        // between the two in-flight sizes forever. Just fill content; never resize.
+        let live_resize = entry.decorated || entry.window.inLiveResize();
+        // cur_w/cur_h track the logical point size so a viewport-only size change
+        // (buffer pixels unchanged) still triggers a resize.
+        if !live_resize && (entry.cur_w != lw as i32 || entry.cur_h != lh as i32) {
+
+            // During an interactive resize the window follows the buffer that
+            // the client actually painted — so content never stretches — and we
+            // keep the corner opposite the dragged edge fixed. Outside a resize,
+            // a plain content-size change keeps the origin put.
+            let resize_info = RESIZE.with(|r| {
+                r.borrow()
+                    .as_ref()
+                    .filter(|s| s.window_id == id)
+                    .map(|s| (s.edges, s.anchor_frame))
+            });
+            if let Some((edges, anchor)) = resize_info {
+                let mut ox = anchor.origin.x;
+                let mut oy = anchor.origin.y;
+                if edges & 4 != 0 {
+                    ox = anchor.origin.x + anchor.size.width - lw; // left: pin right
+                }
+                if edges & 2 != 0 {
+                    oy = anchor.origin.y + anchor.size.height - lh; // bottom: pin top
+                }
+                entry.window.setFrame_display(
+                    CGRect::new(CGPoint::new(ox, oy), CGSize::new(lw, lh)),
+                    true,
+                );
+            } else {
+                entry.window.setContentSize(CGSize::new(lw, lh));
+            }
+            entry.cur_w = lw as i32;
+            entry.cur_h = lh as i32;
         }
         let _ = mtm;
 
         if let Some(layer) = entry.view.layer() {
-            // A CGImageRef is a CFType that responds to retain/release, so it can
-            // be handed to `-[CALayer setContents:]` (typed as `id`).
+            // Keep the hosted root layer sized to the view's ACTUAL current bounds
+            // (AppKit won't size a layer-hosting layer for us). Using the live view
+            // size — not the stale cur_w/cur_h — means the content fills the window
+            // smoothly during a native live resize instead of lagging behind it.
+            // Disable implicit animations so it applies instantly (no resize jitter).
+            let b = entry.view.bounds();
             let img_ptr: *const CGImage = &*image;
             let obj: &AnyObject = unsafe { &*(img_ptr as *const AnyObject) };
-            unsafe { layer.setContents(Some(obj)) };
+            without_animations(|| {
+                layer.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), b.size));
+                // A CGImageRef is a CFType that responds to retain/release, so it
+                // can be handed to `-[CALayer setContents:]` (typed as `id`).
+                unsafe { layer.setContents(Some(obj)) };
+            });
         }
+    });
+}
+
+/// Run `f` with implicit CALayer animations disabled, so geometry/content changes
+/// apply instantly. Without this, every `setFrame`/`setContents` triggers a ~0.25s
+/// implicit animation that lags and jitters during a live window resize.
+fn without_animations<R>(f: impl FnOnce() -> R) -> R {
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    let r = f();
+    CATransaction::commit();
+    r
+}
+
+/// Composite a subsurface as a CALayer sublayer of a window's view. The image is
+/// the subsurface buffer (physical px); the sublayer is placed at the subsurface
+/// position (logical points, converted from Wayland top-left to CALayer y-up).
+#[allow(clippy::too_many_arguments)]
+fn present_subframe(
+    window_id: u32,
+    sub_id: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    stride: i32,
+    dst_w: i32,
+    dst_h: i32,
+    pixels: &[u8],
+) {
+    let Some(image) = make_cgimage(width, height, stride, pixels) else {
+        return;
+    };
+    let scale = crate::input::scale();
+    let (lw, lh) = logical_size(width, height, dst_w, dst_h, scale);
+
+    WINDOWS.with(|w| {
+        let mut map = w.borrow_mut();
+        let Some(entry) = map.get_mut(&window_id) else { return };
+        let Some(root) = entry.view.layer() else { return };
+        let win_h = entry.cur_h as f64;
+
+        let sublayer = entry
+            .sublayers
+            .entry(sub_id)
+            .or_insert_with(|| {
+                let l = CALayer::new();
+                root.addSublayer(&l);
+                l
+            })
+            .clone();
+
+        // Wayland (x,y) is a top-left offset; the view's layer is y-up.
+        let oy = win_h - y as f64 - lh;
+        let img_ptr: *const CGImage = &*image;
+        let obj: &AnyObject = unsafe { &*(img_ptr as *const AnyObject) };
+        // Disable implicit animations so a moving/updating subsurface (e.g. KWin's
+        // cursor) tracks instantly rather than animating behind the pointer.
+        without_animations(|| {
+            sublayer.setContentsScale(scale as f64);
+            sublayer.setFrame(CGRect::new(CGPoint::new(x as f64, oy), CGSize::new(lw, lh)));
+            unsafe { sublayer.setContents(Some(obj)) };
+        });
     });
 }
 

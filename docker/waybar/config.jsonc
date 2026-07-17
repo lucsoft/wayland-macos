@@ -1,0 +1,27 @@
+{
+  "layer": "top",
+  "position": "top",
+  "height": 30,
+  "modules-left": ["custom/launch", "custom/label"],
+  "modules-center": ["clock"],
+  "modules-right": ["cpu", "memory"],
+  "custom/launch": {
+    // Click to (re)summon the fuzzel app launcher.
+    "format": " ☰ Apps ",
+    "on-click": "fuzzel",
+    "tooltip": false
+  },
+  "custom/label": {
+    "format": "  wayland-macos "
+  },
+  "clock": {
+    "format": "{:%a %d %b  %H:%M:%S}",
+    "interval": 1
+  },
+  "cpu": {
+    "format": "CPU {usage}%"
+  },
+  "memory": {
+    "format": "RAM {percentage}%"
+  }
+}

@@ -1,0 +1,26 @@
+* {
+  font-family: "DejaVu Sans", sans-serif;
+  font-size: 13px;
+}
+
+window#waybar {
+  background: #1e1e2e;
+  color: #cdd6f4;
+}
+
+#custom-label {
+  color: #89b4fa;
+  font-weight: bold;
+  padding: 0 10px;
+}
+
+#clock {
+  font-weight: bold;
+  padding: 0 10px;
+}
+
+#cpu,
+#memory {
+  padding: 0 10px;
+  color: #a6e3a1;
+}

@@ -50,7 +50,9 @@ for _ in $(seq 1 50); do [ -S "$CLIENT_SOCK" ] && break; sleep 0.1; done
 # 3. TCP <-> unix bridge so the container can connect
 pkill -f "socat TCP-LISTEN:${PORT}" 2>/dev/null || true
 echo "[mac] starting TCP bridge on :${PORT} -> $CLIENT_SOCK"
-nohup socat "TCP-LISTEN:${PORT},reuseaddr,fork" "UNIX-CONNECT:${CLIENT_SOCK}" \
+# nodelay: disable Nagle's algorithm on the TCP side (see entrypoint.sh) so small
+# Wayland replies aren't stalled ~hundreds of ms.
+nohup socat "TCP-LISTEN:${PORT},reuseaddr,fork,nodelay" "UNIX-CONNECT:${CLIENT_SOCK}" \
     >/tmp/wlmac-socat.log 2>&1 &
 echo $! >/tmp/wlmac-socat.pid
 

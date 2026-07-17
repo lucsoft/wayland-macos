@@ -1,29 +1,23 @@
 # syntax=docker/dockerfile:1
-# Alpine-based runtime — much newer GNOME (50) than Debian trixie. waypipe is
-# built for musl from the same pinned upstream commit + macOS-portability patch as
-# the host side (scripts/build-waypipe.sh), so both ends run the identical revision
-# and the wire versions stay in lock-step.
+# KDE Plasma variant. Unlike GNOME 50 (which dropped mutter's nested backend and
+# forces native KMS), KWin keeps a nested Wayland backend AND a CPU compositor
+# (KWIN_COMPOSE=Q via QPainter), so a full Plasma session can render into our
+# shm-only compositor with no GPU/logind.
 
 FROM rust:alpine AS waypipe-build
-# Keep in sync with scripts/build-waypipe.sh.
 ARG WAYPIPE_REPO=https://gitlab.freedesktop.org/mstoeckl/waypipe.git
 ARG WAYPIPE_COMMIT=1ac039b4d50e2658d284e750c182266cc00efe74
 RUN apk add --no-cache git build-base
 WORKDIR /build
 RUN git clone "$WAYPIPE_REPO" . && git checkout --quiet "$WAYPIPE_COMMIT"
-# The patch is macOS-cfg-gated, so it's a no-op for the Linux build's behavior;
-# applying it anyway keeps "both ends build the same source" literally true.
 COPY waypipe-macos.patch /tmp/waypipe-macos.patch
 RUN git apply /tmp/waypipe-macos.patch
-# Match the macOS build's feature set (no lz4/zstd/dmabuf); the wire uses
-# uncompressed frames (-c none). BuildKit cache mounts persist the registry/target.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --no-default-features --release \
     && cp target/release/waypipe /usr/local/bin/waypipe
 
 FROM alpine:edge
-# The GNOME apps live in community/testing on edge.
 RUN printf '%s\n' \
       https://dl-cdn.alpinelinux.org/alpine/edge/main \
       https://dl-cdn.alpinelinux.org/alpine/edge/community \
@@ -32,31 +26,25 @@ RUN printf '%s\n' \
  && apk add --no-cache \
       bash socat \
       dbus dbus-x11 \
-      gnome-console gnome \
-      gtk4.0 \
-      gdk-pixbuf librsvg \
-      adwaita-icon-theme hicolor-icon-theme \
-      gsettings-desktop-schemas dconf \
-      font-dejavu \
+      kwin plasma-workspace plasma-desktop \
+      konsole dolphin \
+      qt6-qtwayland \
       mesa-dri-gallium mesa-egl mesa-gl \
-      xwayland \
+      adwaita-icon-theme hicolor-icon-theme \
+      font-dejavu \
  && dbus-uuidgen --ensure=/etc/machine-id
 
 COPY --from=waypipe-build /usr/local/bin/waypipe /usr/local/bin/waypipe
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# GTK renders into shm buffers (no GPU) via the cairo renderer. musl is UTF-8
-# natively but some apps still check LANG.
-ENV GDK_BACKEND=wayland \
-    GSK_RENDERER=cairo \
+# QPainter software compositor (no GPU), Qt on Wayland, Qt Quick software backend
+# so plasmashell renders without OpenGL.
+ENV KWIN_COMPOSE=Q \
+    QT_QPA_PLATFORM=wayland \
+    QT_QUICK_BACKEND=software \
     LIBGL_ALWAYS_SOFTWARE=1 \
-    GTK_A11Y=none \
-    GTK_USE_PORTAL=0 \
-    GIO_USE_PORTAL=0 \
-    LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8 \
-    APP=gnome-text-editor \
+    APP=kwin_wayland \
     MAC_HOST=host.docker.internal \
     BRIDGE_PORT=7777
 

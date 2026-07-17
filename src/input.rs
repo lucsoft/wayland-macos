@@ -3,7 +3,7 @@
 //! `wl_pointer` / `wl_keyboard` events. A self-pipe wakes the Wayland poll loop.
 
 use std::collections::VecDeque;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Mutex;
 
@@ -18,6 +18,48 @@ pub fn scale() -> i32 {
 
 pub fn set_scale(s: i32) {
     SCALE.store(s.max(1), Ordering::Relaxed);
+}
+
+/// The virtual output's physical size in pixels, set once at startup from the
+/// main screen. Clients won't grow a window past the output's logical size, so
+/// this must reflect the real display or resizing is capped well below it.
+pub static OUTPUT_W: AtomicI32 = AtomicI32::new(1920);
+pub static OUTPUT_H: AtomicI32 = AtomicI32::new(1080);
+
+pub fn output_size() -> (i32, i32) {
+    (
+        OUTPUT_W.load(Ordering::Relaxed).max(1),
+        OUTPUT_H.load(Ordering::Relaxed).max(1),
+    )
+}
+
+pub fn set_output_size(w: i32, h: i32) {
+    OUTPUT_W.store(w.max(1), Ordering::Relaxed);
+    OUTPUT_H.store(h.max(1), Ordering::Relaxed);
+}
+
+/// Work-area insets (logical points) reserved by docked bars (layer-shell
+/// exclusive zones): (top, right, bottom, left). Toplevels avoid these so they
+/// don't sit under a bar.
+pub static RESERVED_TOP: AtomicI32 = AtomicI32::new(0);
+pub static RESERVED_RIGHT: AtomicI32 = AtomicI32::new(0);
+pub static RESERVED_BOTTOM: AtomicI32 = AtomicI32::new(0);
+pub static RESERVED_LEFT: AtomicI32 = AtomicI32::new(0);
+
+pub fn reserved_insets() -> (i32, i32, i32, i32) {
+    (
+        RESERVED_TOP.load(Ordering::Relaxed),
+        RESERVED_RIGHT.load(Ordering::Relaxed),
+        RESERVED_BOTTOM.load(Ordering::Relaxed),
+        RESERVED_LEFT.load(Ordering::Relaxed),
+    )
+}
+
+pub fn set_reserved_insets(top: i32, right: i32, bottom: i32, left: i32) {
+    RESERVED_TOP.store(top.max(0), Ordering::Relaxed);
+    RESERVED_RIGHT.store(right.max(0), Ordering::Relaxed);
+    RESERVED_BOTTOM.store(bottom.max(0), Ordering::Relaxed);
+    RESERVED_LEFT.store(left.max(0), Ordering::Relaxed);
 }
 
 /// Input events, already translated to Wayland conventions:
@@ -67,10 +109,7 @@ impl InputBus {
     pub fn push(&self, ev: InputEvent) {
         self.queue.lock().unwrap().push_back(ev);
         if let Some(fd) = self.waker.lock().unwrap().as_ref() {
-            let byte = [1u8];
-            unsafe {
-                libc::write(fd.as_raw_fd(), byte.as_ptr() as *const libc::c_void, 1);
-            }
+            let _ = rustix::io::write(fd, &[1u8]);
         }
     }
 

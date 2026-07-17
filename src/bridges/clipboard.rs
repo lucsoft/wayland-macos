@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
 
 use wayland_server::backend::ObjectId;
@@ -222,15 +222,9 @@ fn serve_offer(data: &Arc<OfferData>, fd: OwnedFd) {
 /// A blocking pipe `(read, write)`. Blocking is intentional: the reader thread
 /// should wait for the client to finish writing.
 fn pipe() -> Option<(OwnedFd, OwnedFd)> {
-    let mut fds = [0 as libc::c_int; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        eprintln!(
-            "[clipboard] pipe failed: {}",
-            std::io::Error::last_os_error()
-        );
-        return None;
-    }
-    Some(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    rustix::pipe::pipe()
+        .map_err(|e| eprintln!("[clipboard] pipe failed: {e}"))
+        .ok()
 }
 
 // ---------------------------------------------------------------------------

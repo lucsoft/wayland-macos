@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1
+# RAIL back-end container (for the compositor's `--use-microsoft-rail-protocol`
+# mode). This is the WSLg-style counterpart to the waypipe image: instead of
+# forwarding the Wayland protocol, it runs **Weston as an RDP server** and
+# composites the Linux apps itself, serving them per-window (RemoteApp/RAIL) over
+# RDP. The macOS side connects with a FreeRDP RAIL client and turns each RAIL
+# window into an NSWindow.
+#
+#   Linux app ──Wayland──> Weston (rdp-backend, in here) ──RDP/RAIL/TCP──> macOS
+#
+# Direction note: unlike the waypipe flow (container dials OUT to the Mac), here
+# Weston is the *server* and the Mac dials IN — so the compose service publishes
+# the RDP port (3389) instead of setting MAC_HOST.
+#
+# Debian sid is used because it ships Weston 16 with the RDP backend
+# (libweston-16-0's rdp-backend.so, built against FreeRDP 3) — the same family of
+# component WSLg upstreamed its RAIL work into. RemoteApp/RAIL is negotiated by
+# the connecting client, so the server side just needs to run.
+
+FROM debian:sid
+
+RUN apt-get update -qq \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      weston libweston-16-0 \
+      openssl \
+      dbus dbus-x11 \
+      libgl1-mesa-dri libegl-mesa0 \
+      fonts-dejavu-core \
+      adwaita-icon-theme hicolor-icon-theme \
+      gsettings-desktop-schemas dconf-gsettings-backend \
+      gnome-calculator \
+ && dbus-uuidgen --ensure=/etc/machine-id \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY entrypoint-rail.sh /usr/local/bin/entrypoint-rail.sh
+RUN chmod +x /usr/local/bin/entrypoint-rail.sh
+
+# No GPU in the container: force software GL and the Pixman software renderer
+# (set on the weston command line in the entrypoint).
+ENV GDK_BACKEND=wayland \
+    LIBGL_ALWAYS_SOFTWARE=1 \
+    GTK_USE_PORTAL=0 \
+    GIO_USE_PORTAL=0 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    RDP_PORT=3389 \
+    RDP_WIDTH=1920 \
+    RDP_HEIGHT=1080 \
+    APP=weston-terminal
+
+EXPOSE 3389
+ENTRYPOINT ["/usr/local/bin/entrypoint-rail.sh"]

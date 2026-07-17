@@ -4,9 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Compiles xkb keymaps at runtime from a layout name (links system libxkbcommon
+# + xkeyboard-config, via Homebrew) — no pre-baked keymap file needed.
+xkbcommon = "0.8"
 # Pure-Rust Wayland server backend (no system libwayland needed).
 wayland-server = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "server", "staging", "unstable"] }
+# wlr-layer-shell (standalone docked bars/panels).
+wayland-protocols-wlr = { version = "0.3", features = ["server"] }
 # Cocoa / AppKit bindings.
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry", "NSData"] }
@@ -23,6 +28,7 @@ objc2-app-kit = { version = "0.3", features = [
     "NSTrackingArea",
     "NSScreen",
     "NSPasteboard",
+    "NSCursor",
 ] }
 objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
 objc2-core-graphics = { version = "0.3", features = [
@@ -31,13 +37,24 @@ objc2-core-graphics = { version = "0.3", features = [
     "CGContext",
     "CGBitmapContext",
 ] }
-objc2-quartz-core = { version = "0.3", features = ["CALayer", "objc2-core-foundation"] }
+objc2-quartz-core = { version = "0.3", features = ["CALayer", "CATransaction", "objc2-core-foundation"] }
 dispatch2 = "0.3"
 memmap2 = "0.9"
 libc = "0.2"
 
 # Used only by the test client binary (src/bin/testclient.rs).
 wayland-client = "0.31"
+rustix = { version = "1.1.4", features = ["fs", "pipe", "event", "time", "process"] }
+
+[features]
+# Build the RAIL back-end (`--use-microsoft-rail-protocol`): compiles the
+# FreeRDP C bridge (csrc/) and links FreeRDP 3 + WinPR. Off by default so a
+# plain waypipe build needs no FreeRDP install. Requires `brew install freerdp`.
+rail = []
+
+[build-dependencies]
+# Compiles the FreeRDP C bridge (csrc/rail_bridge.c) when the `rail` feature is on.
+cc = "1"
 
 [[bin]]
 name = "wayland-macos"

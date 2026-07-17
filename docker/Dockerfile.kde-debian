@@ -1,0 +1,125 @@
+# syntax=docker/dockerfile:1
+# KDE Plasma variant on a glibc base (Debian), NOT Alpine/musl.
+#
+# Why Debian: Alpine edge ships musl 1.2.5, and Qt6 6.11 fails to load with
+#   "Error relocating libQt6Core.so.6: renameat2: symbol not found"
+# because musl does not export the renameat2 symbol Qt6 links against. Debian's
+# glibc provides renameat2, so Qt loads cleanly. Using Debian unstable (sid) keeps
+# the packages close to Alpine edge's freshness (Plasma 6 / Qt 6) while still
+# actually running.
+#
+# Like the Alpine KDE image, this relies on KWin keeping a nested Wayland backend
+# AND a CPU compositor (KWIN_COMPOSE=Q via QPainter), so a full Plasma session can
+# render into our shm-only compositor with no GPU/logind.
+
+# --- waypipe, built for glibc from the SAME pinned commit + patch as the other
+# --- Dockerfiles so the wire protocol stays in lock-step with the macOS side.
+FROM rust:bookworm AS waypipe-build
+# Keep in sync with scripts/build-waypipe.sh, docker/Dockerfile, docker/Dockerfile.kde.
+ARG WAYPIPE_REPO=https://gitlab.freedesktop.org/mstoeckl/waypipe.git
+ARG WAYPIPE_COMMIT=1ac039b4d50e2658d284e750c182266cc00efe74
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git build-essential pkg-config ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+RUN git clone "$WAYPIPE_REPO" . && git checkout --quiet "$WAYPIPE_COMMIT"
+# macOS-cfg-gated patch: a no-op for the Linux build, applied so "both ends build
+# the same source" stays literally true.
+COPY waypipe-macos.patch /tmp/waypipe-macos.patch
+RUN git apply /tmp/waypipe-macos.patch
+# Match the macOS build's feature set (no lz4/zstd/dmabuf); the wire uses
+# uncompressed frames (-c none). BuildKit cache mounts persist the registry/target.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --no-default-features --release \
+    && cp target/release/waypipe /usr/local/bin/waypipe
+
+FROM debian:sid
+# Debian unstable (sid): Plasma 6 / Qt 6 — much newer than bookworm's Plasma 5.27.
+# sid's glibc still exports renameat2 (the symbol Alpine/musl lacked), so Qt loads
+# cleanly. kwin_wayland still keeps a nested Wayland backend and a QPainter
+# (software) compositor (KWIN_COMPOSE=Q), which is what we need with no GPU.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash socat \
+      dbus dbus-x11 \
+      kwin-wayland \
+      plasma-workspace plasma-desktop \
+      konsole \
+      qt6-wayland \
+      waybar \
+      fuzzel \
+      firefox-esr \
+      libgl1-mesa-dri libglx-mesa0 libglvnd0 \
+      breeze breeze-icon-theme hicolor-icon-theme \
+      fonts-dejavu \
+      libcap2-bin \
+ && rm -rf /var/lib/apt/lists/* \
+ && dbus-uuidgen --ensure=/etc/machine-id \
+ # Debian's kwin_wayland ships with the cap_sys_resource file capability. Docker's
+ # default capability bounding set excludes it, so execve of a binary carrying it
+ # as a *permitted* file cap fails with EPERM ("Operation not permitted"). We do
+ # not need the raised rlimits it grants, so strip the file cap to let it run.
+ # (Tolerate its absence in case a future build ships without the cap.)
+ && setcap -r /usr/bin/kwin_wayland || true
+
+COPY --from=waypipe-build /usr/local/bin/waypipe /usr/local/bin/waypipe
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# KWin script that activates+maximizes client windows as they appear. Without a
+# shell (plasmashell) a bare nested KWin leaves the window unpainted (black
+# output); activating it forces KWin to composite it. Enabled globally via kwinrc.
+# waybar (a wlr-layer-shell bar) + a minimal config, to demo a standalone docked
+# appbar: `docker compose --profile kde run ... -e APP=waybar wayland-kde`.
+COPY waybar /etc/xdg/waybar
+
+# The "shell" profile's launch script: docked bar (waybar) + app launcher (fuzzel).
+COPY run-shell.sh /usr/local/bin/run-shell.sh
+RUN chmod +x /usr/local/bin/run-shell.sh
+
+COPY kwin-showwindows /usr/share/kwin/scripts/showwindows
+# Enable the script; focus-follows-mouse + auto-raise so hovering the window both
+# activates (repaints) and keyboard-focuses it — a bare session has no shell to do
+# window management, and click-to-focus wasn't routing keyboard input to the app.
+RUN mkdir -p /etc/xdg && printf '%s\n' \
+      '[Plugins]' \
+      'showwindowsEnabled=true' \
+      '' \
+      '[Windows]' \
+      'FocusPolicy=FocusFollowsMouse' \
+      'AutoRaise=true' \
+      'AutoRaiseInterval=0' \
+      'DelayFocusInterval=0' \
+      'FocusStealingPreventionLevel=0' \
+      > /etc/xdg/kwinrc
+
+# QPainter software compositor (no GPU), Qt on Wayland, Qt Quick software backend
+# so plasmashell renders without OpenGL.
+#
+# Default APP runs KWin nested with a single konsole window. Notes on the args:
+#   --socket wayland-1  KWin's OWN nested display; must differ from the parent's
+#                       wayland-0 or the two collide in the shared runtime dir.
+#   --scale 2           render at 2x so the output is crisp on a Retina Mac (the
+#                       compositor advertises scale 2). Set to 1 for a non-Retina
+#                       display, or override APP entirely.
+#   --output-count 1    exactly one nested output window (avoids a stray second).
+# konsole is stable nested; plasmashell (the full shell) still crashes here, so
+# it is not the default — override APP with "... plasmashell" to try it.
+ENV KWIN_COMPOSE=Q \
+    QT_QPA_PLATFORM=wayland \
+    QT_QUICK_BACKEND=software \
+    QT_XCB_GL_INTEGRATION=none \
+    LIBGL_ALWAYS_SOFTWARE=1 \
+    KWIN_X11_NO_SYNC_TO_VBLANK=1 \
+    # NOTE: do NOT set KWIN_FORCE_SW_CURSOR — with it, KWin draws the cursor into
+    # its output buffer but only on repaint, so the cursor vanishes. Left unset,
+    # KWin renders the cursor as its own subsurface, which we composite as a
+    # sublayer that tracks the pointer (see present_subframe).
+    # konsole (and login shells) need $SHELL; without it konsole prints
+    # "Program to run not set" and opens with no shell.
+    SHELL=/bin/bash \
+    APP="kwin_wayland --wayland-display wayland-0 --socket wayland-1 --width 1280 --height 800 --scale 2 --output-count 1 konsole" \
+    MAC_HOST=host.docker.internal \
+    BRIDGE_PORT=7777
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
