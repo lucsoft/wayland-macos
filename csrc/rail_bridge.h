@@ -43,7 +43,18 @@ typedef struct {
      * the app's own titlebar (RAIL Server Local Move/Size, type MOVE). The Rust
      * side turns this into a native NSWindow drag. */
     void (*window_move_start)(void *user, uint32_t id);
+    /* Emit a bridge log line through Rust's `log` facade so it shares the
+     * compositor's format/filtering. `level` is a RAIL_LOG_* severity (see
+     * rail_bridge.c); `msg` is a NUL-terminated, already-formatted string valid
+     * only for the duration of the call. May be NULL if Rust wired no logger. */
+    void (*log)(void *user, int level, const char *msg);
 } rail_callbacks;
+
+/* Severities for rail_callbacks.log — mirror Rust's log::Level ordering. */
+#define RAIL_LOG_ERROR 0
+#define RAIL_LOG_WARN  1
+#define RAIL_LOG_INFO  2
+#define RAIL_LOG_DEBUG 3
 
 /* Connect to host:port, launch/attach the RemoteApp `app`, and run the FreeRDP
  * event loop until disconnect or rail_stop(). Blocking — call on a dedicated

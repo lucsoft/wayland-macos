@@ -33,7 +33,7 @@ use crate::input::InputBus;
 #[cfg(feature = "rail")]
 mod imp {
     use super::*;
-    use log::{debug, info, warn};
+    use log::{debug, error, info, warn};
     use std::ffi::{c_char, c_int, c_void, CStr, CString};
     use std::os::fd::OwnedFd;
     use std::ptr;
@@ -68,6 +68,7 @@ mod imp {
         window_surface: extern "C" fn(*mut c_void, u32, u32, u32, u32, *const u8),
         disconnected: extern "C" fn(*mut c_void),
         window_move_start: extern "C" fn(*mut c_void, u32),
+        log: extern "C" fn(*mut c_void, c_int, *const c_char),
     }
 
     extern "C" {
@@ -217,6 +218,20 @@ mod imp {
         }
     }
 
+    /// Bridge log callback (see `rail_callbacks.log`): re-emit the C bridge's
+    /// messages through the `log` facade so they share the `rail` target,
+    /// thread name, and RUST_LOG filtering with the rest of the process. Levels
+    /// mirror the RAIL_LOG_* constants in `rail_bridge.h`.
+    extern "C" fn on_log(_user: *mut c_void, level: c_int, msg: *const c_char) {
+        let msg = cstr(msg);
+        match level {
+            0 => error!(target: "rail", "{msg}"),
+            1 => warn!(target: "rail", "{msg}"),
+            2 => info!(target: "rail", "{msg}"),
+            _ => debug!(target: "rail", "{msg}"),
+        }
+    }
+
     /// A pipe whose read end blocks (the drain loop sleeps on it) and whose write
     /// end is non-blocking (so `InputBus::push` from AppKit never stalls).
     fn waker_pipe() -> (OwnedFd, OwnedFd) {
@@ -278,6 +293,7 @@ mod imp {
                 window_surface: on_window_surface,
                 disconnected: on_disconnected,
                 window_move_start: on_window_move_start,
+                log: on_log,
             };
             let rc = unsafe {
                 rail_run(

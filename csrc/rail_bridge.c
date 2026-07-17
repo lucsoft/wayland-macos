@@ -5,6 +5,8 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <stdarg.h>
 
 #include <freerdp/freerdp.h>
 #include <freerdp/client.h>
@@ -51,6 +53,23 @@ typedef struct {
  * send functions (called from Rust's input-drain thread) need to reach it. */
 static railContext *g_ctx = NULL;
 static rail_callbacks g_cb;
+
+/* Log through Rust's `log` facade (so bridge lines share the compositor's
+ * format/filtering). Formats into a stack buffer and hands it to g_cb.log; if
+ * Rust wired no logger (or we log before rail_run sets g_cb), fall back to
+ * stderr with the old [rail-c] prefix. */
+static void bridge_log(int level, const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (g_cb.log) {
+        g_cb.log(g_cb.user, level, buf);
+    } else {
+        fprintf(stderr, "[rail-c] %s\n", buf);
+    }
+}
 /* The most recent real (non-0x0) RAIL window. WSLg delivers window content as
  * rdpgfx surfaces that (in this build) arrive without a MapSurfaceToWindow, so
  * we associate unmapped content surfaces with this window. */
@@ -334,9 +353,9 @@ static UINT rail_send_client_status(RailClientContext *rail) {
                TS_RAIL_CLIENTSTATUS_ZORDER_SYNC |
                TS_RAIL_CLIENTSTATUS_WINDOW_RESIZE_MARGIN_SUPPORTED |
                TS_RAIL_CLIENTSTATUS_HIGH_DPI_ICONS_SUPPORTED;
-    fprintf(stderr, "[rail-c] server handshake -> sending ClientInformation\n");
+    bridge_log(RAIL_LOG_INFO, "server handshake -> sending ClientInformation");
     UINT rc = rail->ClientInformation(rail, &cs);
-    fprintf(stderr, "[rail-c] ClientInformation rc=%u\n", rc);
+    bridge_log(RAIL_LOG_INFO, "ClientInformation rc=%u", rc);
     if (rc != CHANNEL_RC_OK)
         return rc;
 
@@ -351,7 +370,7 @@ static UINT rail_send_client_status(RailClientContext *rail) {
     memset(&exec, 0, sizeof(exec));
     exec.RemoteApplicationProgram = (char *)program;
     rc = rail->ClientExecute(rail, &exec);
-    fprintf(stderr, "[rail-c] ClientExecute program=%s rc=%u\n", program, rc);
+    bridge_log(RAIL_LOG_INFO, "ClientExecute program=%s rc=%u", program, rc);
     return rc;
 }
 
@@ -384,7 +403,7 @@ static UINT rail_on_server_local_move_size(RailClientContext *rail,
 static void on_channel_connected(void *context, ChannelConnectedEventArgs *e) {
     rdpContext *ctx = (rdpContext *)context;
     if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0) {
-        fprintf(stderr, "[rail-c] rdpgfx channel connected; wiring gdi pipeline\n");
+        bridge_log(RAIL_LOG_INFO, "rdpgfx channel connected; wiring gdi pipeline");
         RdpgfxClientContext *gfx = (RdpgfxClientContext *)e->pInterface;
         gdi_graphics_pipeline_init(ctx->gdi, gfx);
         /* Take over per-window surface delivery (RAIL window content). Must be
@@ -399,7 +418,7 @@ static void on_channel_connected(void *context, ChannelConnectedEventArgs *e) {
          * ("context->custom not set" -> channel error -> session drop). */
         ((CliprdrClientContext *)e->pInterface)->custom = ctx;
     } else if (strcmp(e->name, RAIL_SVC_CHANNEL_NAME) == 0) {
-        fprintf(stderr, "[rail-c] rail channel connected; starting RAIL\n");
+        bridge_log(RAIL_LOG_INFO, "rail channel connected; starting RAIL");
         RailClientContext *rail = (RailClientContext *)e->pInterface;
         rail->custom = ctx;
         rail->ServerHandshake = rail_on_server_handshake;
@@ -599,8 +618,8 @@ int rail_run(const char *host, int port, const char *app, uint32_t desktop_w,
     }
     if (exit_reason == 0)
         exit_reason = 1;
-    fprintf(stderr, "[rail-c] event loop exit: reason=%d last_error=0x%08x\n",
-            exit_reason, freerdp_get_last_error(ctx));
+    bridge_log(RAIL_LOG_INFO, "event loop exit: reason=%d last_error=0x%08x",
+               exit_reason, freerdp_get_last_error(ctx));
 
     freerdp_disconnect(instance);
     g_cb.disconnected(g_cb.user);
