@@ -753,7 +753,7 @@ impl WinDelegate {
 /// Transfer function (electro-optical curve) of a surface's content, from the
 /// color-management protocol. `Pq`/`Hlg` are the HDR curves that light up the
 /// display's Extended Dynamic Range headroom; `Srgb` is ordinary SDR.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum TransferFn {
     Srgb,
     Pq,
@@ -761,7 +761,7 @@ pub enum TransferFn {
 }
 
 /// Color primaries (gamut) of a surface's content.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Primaries {
     Srgb,
     DisplayP3,
@@ -772,7 +772,7 @@ pub enum Primaries {
 /// Built on the Wayland side (see `color_management.rs`) and carried to the
 /// AppKit side so `make_cgimage` can pick a matching `CGColorSpace` and the
 /// layer can opt into EDR.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ColorDesc {
     pub tf: TransferFn,
     pub primaries: Primaries,
@@ -794,7 +794,7 @@ impl ColorDesc {
 /// Memory layout of the raw pixels in a `WinCmd::Frame`/`SubFrame`, so the AppKit
 /// side interprets them without a lossy 8-bit conversion. Mirrors the shm formats
 /// accepted in `shm.rs` (see `buffer_to_pixels`).
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum PixelFormat {
     /// 32-bit, byte order B,G,R,X/A (Wayland XRGB8888/ARGB8888 little-endian).
     Bgra8888,
@@ -805,6 +805,11 @@ pub enum PixelFormat {
 }
 
 /// A command sent from the Wayland thread to the AppKit main thread.
+///
+/// `Serialize`/`Deserialize` let the exact same command cross a process boundary
+/// in `--multiplex` mode, where the AppKit "main thread" lives in a separate
+/// per-app window-host process (see `src/ipc.rs`, `src/host.rs`).
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum WinCmd {
     /// Create a native window for a Wayland toplevel.
     Create {
@@ -912,6 +917,17 @@ pub enum WinCmd {
     /// Mark a window as a modal dialog / clear that mark (xdg_dialog_v1).
     /// Modal dialogs float above their normal-level windows.
     SetModal { id: u32, modal: bool },
+    /// Set the app's Dock/Cmd-Tab icon from raw BGRA pixels (from
+    /// `xdg_toplevel_icon_v1`, or a generated fallback). In --multiplex mode this
+    /// targets the window's host process (one app per client). `id` identifies the
+    /// owning window for routing.
+    SetIcon {
+        id: u32,
+        width: i32,
+        height: i32,
+        stride: i32,
+        pixels: Vec<u8>,
+    },
     /// Destroy a window.
     Destroy { id: u32 },
     /// Create a docked bar/panel (wlr-layer-shell): a borderless floating window
@@ -1097,6 +1113,30 @@ fn refresh_cursor_rects() {
 /// Build an `NSCursor` from a client cursor-surface buffer. The buffer is in
 /// physical pixels; the image is shown at logical points (÷scale) and the hotspot
 /// is already in surface-local (logical) coordinates.
+/// Set this process's Dock / Cmd-Tab icon from raw BGRA pixels. In --multiplex
+/// mode each app is its own process, so this sets that one app's icon; the source
+/// is either `xdg_toplevel_icon_v1` artwork or the generated identicon fallback.
+pub(crate) fn set_app_icon(
+    mtm: MainThreadMarker,
+    width: i32,
+    height: i32,
+    stride: i32,
+    pixels: &[u8],
+) {
+    let Some(image) = make_cgimage(width, height, stride, pixels, PixelFormat::Bgra8888, None)
+    else {
+        eprintln!("[mac] failed to build CGImage for app icon");
+        return;
+    };
+    let size = CGSize::new(width as f64, height as f64);
+    let ns_image = NSImage::initWithCGImage_size(mtm.alloc::<NSImage>(), &image, size);
+    // Safe: NSImage built above is a valid image; the call just swaps the Dock icon.
+    unsafe {
+        NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&ns_image));
+    }
+    eprintln!("[mac] set app icon {width}x{height}");
+}
+
 fn make_cursor(
     mtm: MainThreadMarker,
     width: i32,
@@ -1212,7 +1252,26 @@ pub fn post(cmd: WinCmd) {
             return;
         }
     }
+    // --multiplex mode: this process owns no windows; hand the command to the
+    // per-app window-host that owns the target window (see src/router.rs).
+    if crate::router::is_enabled() {
+        crate::router::route(cmd);
+        return;
+    }
     DispatchQueue::main().exec_async(move || handle(cmd));
+}
+
+/// In `--multiplex` mode, tell the router which app a soon-to-be-created window
+/// belongs to (spawning that app's host on first use). A no-op otherwise, so the
+/// Wayland engine can call it unconditionally before posting a `Create`.
+pub fn assign_window(win_id: u32, app_key: u32, name: &str, regular: bool) {
+    crate::router::assign_window(win_id, app_key, name, regular);
+}
+
+/// In `--multiplex` mode, push updated docked-bar insets to every window-host so
+/// their windows keep avoiding a bar that lives in another process. No-op otherwise.
+pub fn broadcast_insets(top: i32, right: i32, bottom: i32, left: i32) {
+    crate::router::broadcast_insets(top, right, bottom, left);
 }
 
 fn handle(cmd: WinCmd) {
@@ -1398,6 +1457,13 @@ fn handle(cmd: WinCmd) {
                 }
             });
         }
+        WinCmd::SetIcon {
+            id: _,
+            width,
+            height,
+            stride,
+            pixels,
+        } => set_app_icon(mtm, width, height, stride, &pixels),
         WinCmd::Destroy { id } => {
             // If the grabbing popup is going away, clear the grab.
             let grab_ended = GRAB.with(|g| {

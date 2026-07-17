@@ -75,6 +75,7 @@ use wayland_protocols::xdg::shell::server::{
     xdg_wm_base::{self, XdgWmBase},
 };
 use wayland_protocols::xdg::activation::v1::server::xdg_activation_v1::XdgActivationV1;
+use wayland_protocols::xdg::toplevel_icon::v1::server::xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1;
 use wayland_protocols::xdg::dialog::v1::server::xdg_wm_dialog_v1::XdgWmDialogV1;
 use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
 use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::server::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1;
@@ -118,6 +119,7 @@ const KEYBOARD_SHORTCUTS_INHIBIT_VERSION: u32 = 1;
 const PRIMARY_SELECTION_VERSION: u32 = 1;
 const LAYER_SHELL_VERSION: u32 = 4;
 const COLOR_MANAGEMENT_VERSION: u32 = 1;
+const XDG_TOPLEVEL_ICON_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Shared memory
@@ -148,6 +150,7 @@ mod primary_selection;
 mod layer_shell;
 mod clipboard;
 mod color_management;
+mod xdg_toplevel_icon;
 
 struct PoolMem {
     fd: OwnedFd,
@@ -335,6 +338,9 @@ struct ToplevelRec {
     xdg_surface: XdgSurface,
     wl_surface: WlSurface,
     title: String,
+    /// `xdg_toplevel.set_app_id` — the app identifier (e.g. "org.gnome.Console").
+    /// In --multiplex mode this names the app's native macOS Dock/Cmd-Tab entry.
+    app_id: String,
     window_id: u32,
     configured: bool,
     created_window: bool,
@@ -345,6 +351,18 @@ struct ToplevelRec {
     /// CSD toolkits (GTK/libadwaita, which never create a decoration) stay
     /// borderless and draw their own chrome into the buffer.
     wants_ssd: bool,
+    /// Icon pixels (w, h, stride, BGRA) from `xdg_toplevel_icon` that arrived
+    /// before the window existed; flushed as `WinCmd::SetIcon` once it's created.
+    pending_icon: Option<(i32, i32, i32, Vec<u8>)>,
+}
+
+/// Icon state accumulated on an `xdg_toplevel_icon_v1` before `set_icon` assigns
+/// it to a toplevel: an optional themed name and/or one or more pixel buffers (at
+/// different scales). See `xdg_toplevel_icon.rs`.
+#[derive(Default)]
+struct IconRec {
+    name: Option<String>,
+    buffers: Vec<(WlBuffer, i32)>,
 }
 
 /// Placement request built up on an `xdg_positioner` before `get_popup`.
@@ -446,6 +464,11 @@ pub struct State {
     next_window_id: u32,
     next_serial: u32,
     start: Instant,
+    /// wl client -> stable small app id, used in --multiplex mode to route each
+    /// window to the per-app window-host process. Never pruned (ids stay unique).
+    client_app_ids: HashMap<ClientId, u32>,
+    /// xdg_toplevel_icon_v1 object id -> its accumulated icon state.
+    icon_objects: HashMap<ObjectId, IconRec>,
     surfaces: HashMap<ObjectId, SurfaceRec>,
     toplevels: HashMap<ObjectId, ToplevelRec>,
     /// wl_surface id -> xdg_toplevel id
@@ -512,6 +535,8 @@ impl State {
             next_window_id: 1,
             next_serial: 1,
             start: Instant::now(),
+            client_app_ids: HashMap::new(),
+            icon_objects: HashMap::new(),
             surfaces: HashMap::new(),
             toplevels: HashMap::new(),
             surface_toplevel: HashMap::new(),
@@ -804,6 +829,13 @@ impl State {
                 return;
             };
             if !t.created_window {
+                // --multiplex: assign this window to its client's app before the
+                // Create so the router spawns/targets the right host. Disjoint
+                // field borrow (client_app_ids vs toplevels), so `t` stays valid.
+                let app_key =
+                    app_key_for(&mut self.client_app_ids, t.wl_surface.client().map(|c| c.id()));
+                let name = app_display_name(&t.app_id, &t.title);
+                mac::assign_window(t.window_id, app_key, &name, true);
                 mac::post(WinCmd::Create {
                     id: t.window_id,
                     width: width,
@@ -815,6 +847,17 @@ impl State {
                     geom,
                 });
                 t.created_window = true;
+                // Flush an icon that arrived before the window existed (routing
+                // needs win_to_app, populated by assign_window just above).
+                if let Some((iw, ih, istride, ipx)) = t.pending_icon.take() {
+                    mac::post(WinCmd::SetIcon {
+                        id: t.window_id,
+                        width: iw,
+                        height: ih,
+                        stride: istride,
+                        pixels: ipx,
+                    });
+                }
                 if let Some(sr) = self.surfaces.get_mut(sid) {
                     sr.window_id = Some(t.window_id);
                 }
@@ -921,6 +964,9 @@ impl State {
             }
         }
         crate::input::set_reserved_insets(top, right, bottom, left);
+        // In multiplex mode the bar and the toplevels live in different host
+        // processes, so push the insets to each host's copy too (no-op otherwise).
+        crate::mac::broadcast_insets(top, right, bottom, left);
     }
 
     /// Map/update a docked bar (wlr-layer-shell): create a borderless floating
@@ -947,6 +993,11 @@ impl State {
             )
         };
         if !created {
+            // --multiplex: a layer-shell bar gets its own host too, but as an
+            // Accessory app (regular=false) so the bar itself has no Dock tile.
+            let app_key =
+                app_key_for(&mut self.client_app_ids, surface.client().map(|c| c.id()));
+            mac::assign_window(window_id, app_key, "bar", false);
             mac::post(WinCmd::CreateLayer {
                 id: window_id,
                 width,
@@ -1314,6 +1365,54 @@ fn frame_pointer(p: &WlPointer) {
     }
 }
 
+/// Map a client to its stable small app id (see `State::client_app_ids`),
+/// assigning a fresh one on first sight. `None` client → 0. Takes only the map so
+/// it can be called while another `State` field (e.g. `toplevels`) is borrowed.
+fn app_key_for(map: &mut HashMap<ClientId, u32>, cid: Option<ClientId>) -> u32 {
+    match cid {
+        Some(cid) => match map.get(&cid) {
+            Some(k) => *k,
+            None => {
+                let k = map.len() as u32;
+                map.insert(cid, k);
+                k
+            }
+        },
+        None => 0,
+    }
+}
+
+/// Human-facing app name for a toplevel's native macOS Dock/Cmd-Tab entry in
+/// --multiplex mode. Prefers the app id's last dotted component, capitalized
+/// (e.g. "org.gnome.Console" -> "Console"), else the window title, else a
+/// fallback. Reserved characters that can't appear in a symlink name are stripped
+/// (the name becomes an executable path basename — see router::spawn_helper).
+fn app_display_name(app_id: &str, title: &str) -> String {
+    let raw = if !app_id.is_empty() {
+        let last = app_id.rsplit('.').next().unwrap_or(app_id);
+        let mut c = last.chars();
+        match c.next() {
+            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            None => app_id.to_string(),
+        }
+    } else if !title.is_empty() && title != "Wayland Window" {
+        title.to_string()
+    } else {
+        "wayland-macos".to_string()
+    };
+    // Keep it a safe, single-path-component basename.
+    let cleaned: String = raw
+        .chars()
+        .map(|ch| if ch == '/' || ch == '\0' || ch == ':' { '-' } else { ch })
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        "wayland-macos".to_string()
+    } else {
+        cleaned.chars().take(64).collect()
+    }
+}
+
 fn same_client<R: Resource>(res: &R, surface: &WlSurface) -> bool {
     match (res.client(), surface.client()) {
         (Some(a), Some(b)) => a.id() == b.id(),
@@ -1331,10 +1430,13 @@ fn make_keymap_file() -> Option<(std::fs::File, u32)> {
     use std::io::Write;
     use xkbcommon::xkb;
 
+    // Layout was detected on the main thread and cached (see input::mac_layout);
+    // we must NOT call the Carbon TIS API from this (Wayland) thread — it races
+    // AppKit's TSM init and aborts the process.
     let layout = std::env::var("WLMAC_LAYOUT")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(crate::mac::macos_keyboard_layout)
+        .or_else(crate::input::mac_layout)
         .unwrap_or_else(|| "us".to_string());
 
     let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
@@ -1412,6 +1514,7 @@ pub fn run(bus: Arc<InputBus>) {
     dh.create_global::<State, ZwpPrimarySelectionDeviceManagerV1, _>(PRIMARY_SELECTION_VERSION, ());
     dh.create_global::<State, ZwlrLayerShellV1, _>(LAYER_SHELL_VERSION, ());
     dh.create_global::<State, WpColorManagerV1, _>(COLOR_MANAGEMENT_VERSION, ());
+    dh.create_global::<State, XdgToplevelIconManagerV1, _>(XDG_TOPLEVEL_ICON_VERSION, ());
 
     let socket = ListeningSocket::bind_auto("wayland", 1..32).expect("bind wayland socket");
     let name = socket
@@ -1620,6 +1723,24 @@ mod tests {
         // A non-positive size is ignored (guards against bogus resize requests).
         pool.resize(0);
         assert_eq!(len(&pool), Some(8192), "resize(0) leaves the mapping intact");
+    }
+
+    /// --multiplex Dock/Cmd-Tab naming: `app_display_name` prefers the app id's
+    /// last dotted component (capitalized), falls back to the title, and never
+    /// yields a string that would break a symlink basename (see spawn_helper).
+    #[test]
+    fn app_display_name_prefers_app_id_then_title() {
+        // app_id wins, last dotted component, capitalized.
+        assert_eq!(app_display_name("org.gnome.Console", "Terminal"), "Console");
+        assert_eq!(app_display_name("org.mozilla.firefox", "Mozilla Firefox"), "Firefox");
+        assert_eq!(app_display_name("kgx", ""), "Kgx");
+        // No app_id → use the title, unless it's the placeholder.
+        assert_eq!(app_display_name("", "My Editor"), "My Editor");
+        assert_eq!(app_display_name("", "Wayland Window"), "wayland-macos");
+        assert_eq!(app_display_name("", ""), "wayland-macos");
+        // Path/colon/NUL separators can't appear in a symlink basename.
+        assert!(!app_display_name("com.foo/bar", "").contains('/'));
+        assert_eq!(app_display_name("a/b:c", ""), "A-b-c");
     }
 
     /// Regression #7: `xdg_positioner` anchor + gravity + offset resolve to the

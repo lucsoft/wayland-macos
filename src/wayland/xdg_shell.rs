@@ -118,12 +118,14 @@ impl Dispatch<XdgSurface, WlSurface> for State {
                         xdg_surface: xdg_surface.clone(),
                         wl_surface: wl_surface.clone(),
                         title: "Wayland Window".to_string(),
+                        app_id: String::new(),
                         window_id,
                         configured: false,
                         created_window: false,
                         maximized: false,
                         fullscreen: false,
                         wants_ssd: false,
+                        pending_icon: None,
                     },
                 );
                 state
@@ -237,6 +239,14 @@ impl Dispatch<XdgToplevel, XdgSurface> for State {
                             title,
                         });
                     }
+                }
+            }
+            xdg_toplevel::Request::SetAppId { app_id } => {
+                // Records the app identifier used to name the native macOS app in
+                // --multiplex mode. Usually arrives before the first buffer, so it
+                // is available by the time we spawn the window-host (see present).
+                if let Some(t) = state.toplevels.get_mut(&toplevel.id()) {
+                    t.app_id = app_id;
                 }
             }
             xdg_toplevel::Request::Move { .. } => {

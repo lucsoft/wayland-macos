@@ -26,6 +26,9 @@ use wayland_protocols::wp::color_management::v1::client::{
     wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1,
     wp_image_description_v1::WpImageDescriptionV1,
 };
+use wayland_protocols::xdg::toplevel_icon::v1::client::{
+    xdg_toplevel_icon_manager_v1, xdg_toplevel_icon_v1,
+};
 
 const WIDTH: i32 = 400;
 const HEIGHT: i32 = 300;
@@ -43,6 +46,47 @@ struct State {
     image_desc: Option<WpImageDescriptionV1>,
     // Keep the mapping and buffer alive for the lifetime of the window.
     _keep: Option<(std::fs::File, MmapMut, wl_buffer::WlBuffer)>,
+    // Keep the icon manager, icon object, and its backing buffer alive.
+    _icon_keep: Option<(
+        xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1,
+        xdg_toplevel_icon_v1::XdgToplevelIconV1,
+        std::fs::File,
+        MmapMut,
+        wl_buffer::WlBuffer,
+    )>,
+}
+
+/// Create an `w`x`h` wl_shm buffer filled with a solid BGRA color.
+fn make_solid_buffer(
+    shm: &wl_shm::WlShm,
+    qh: &QueueHandle<State>,
+    w: i32,
+    h: i32,
+    bgra: [u8; 4],
+) -> (std::fs::File, MmapMut, wl_buffer::WlBuffer) {
+    let stride = w * 4;
+    let size = stride * h;
+    let path = format!(
+        "{}/wlmac-icon-{}",
+        std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into()),
+        std::process::id()
+    );
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .expect("open icon shm file");
+    let _ = std::fs::remove_file(&path);
+    file.set_len(size as u64).expect("set_len");
+    let mut mmap = unsafe { MmapMut::map_mut(&file).expect("mmap") };
+    for px in mmap.chunks_exact_mut(4) {
+        px.copy_from_slice(&bgra);
+    }
+    let pool = shm.create_pool(file.as_fd(), size, qh, ());
+    let buffer = pool.create_buffer(0, w, h, stride, wl_shm::Format::Argb8888, qh, ());
+    (file, mmap, buffer)
 }
 
 fn main() {
@@ -62,6 +106,22 @@ fn main() {
     let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
     let toplevel = xdg_surface.get_toplevel(&qh, ());
     toplevel.set_title(if hdr { "Rust test client (HDR/PQ)" } else { "Rust test client" }.to_string());
+    // app_id drives the --multiplex Dock/Cmd-Tab name → "TestApp".
+    toplevel.set_app_id("org.example.TestApp".to_string());
+
+    // Set a real toplevel icon (a 64x64 solid tile) via xdg_toplevel_icon, to
+    // exercise the compositor's real-artwork path (→ WinCmd::SetIcon).
+    let icon_keep = globals
+        .bind::<xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1, _, _>(&qh, 1..=1, ())
+        .ok()
+        .map(|mgr| {
+            let (file, mmap, buf) = make_solid_buffer(&shm, &qh, 64, 64, [0, 0, 255, 255]);
+            let icon = mgr.create_icon(&qh, ());
+            icon.add_buffer(&buf, 1);
+            mgr.set_icon(&toplevel, Some(&icon));
+            (mgr, icon, file, mmap, buf)
+        });
+
     surface.commit();
 
     // In HDR mode, build a BT.2100 PQ image description and a color-managed
@@ -91,6 +151,7 @@ fn main() {
         cm_surface,
         image_desc,
         _keep: None,
+        _icon_keep: icon_keep,
     };
 
     println!("[client] connected ({}); waiting for configure...", if hdr { "HDR/PQ" } else { "SDR" });
@@ -315,3 +376,5 @@ noop_dispatch!(WpColorManagerV1);
 noop_dispatch!(WpImageDescriptionCreatorParamsV1);
 noop_dispatch!(WpImageDescriptionV1);
 noop_dispatch!(WpColorManagementSurfaceV1);
+noop_dispatch!(xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1);
+noop_dispatch!(xdg_toplevel_icon_v1::XdgToplevelIconV1);

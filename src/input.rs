@@ -5,7 +5,21 @@
 use std::collections::VecDeque;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+
+/// The macOS keyboard layout, detected once on the **main thread** at startup and
+/// cached here for the Wayland thread. The detection API (Carbon TIS/TSM) is
+/// main-thread-only and aborts the process if called concurrently with AppKit's
+/// own TSM init — so the Wayland thread must read this cache, never call TIS.
+static MAC_LAYOUT: OnceLock<Option<String>> = OnceLock::new();
+
+pub fn set_mac_layout(layout: Option<String>) {
+    let _ = MAC_LAYOUT.set(layout);
+}
+
+pub fn mac_layout() -> Option<String> {
+    MAC_LAYOUT.get().cloned().flatten()
+}
 
 /// Integer display scale (1 or 2), set once at startup from the main screen's
 /// backing scale factor. Shared by the AppKit side (buffer→point conversion) and
@@ -65,6 +79,7 @@ pub fn set_reserved_insets(top: i32, right: i32, bottom: i32, left: i32) {
 /// Input events, already translated to Wayland conventions:
 /// coordinates are surface-local top-left pixels, keycodes are evdev, and
 /// modifier masks are xkb masks.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum InputEvent {
     PointerEnter { window_id: u32, x: f64, y: f64 },
     PointerMotion { window_id: u32, x: f64, y: f64 },

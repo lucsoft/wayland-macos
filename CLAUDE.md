@@ -28,6 +28,44 @@ Linux app ──> waypipe (server, in container) ──TCP──> waypipe (clien
   `StartMove`, `StartResize`, …). It is `Send`, which also makes it the natural
   test seam (see Testing).
 
+## Multiplex mode (`--multiplex`)
+
+By default one `NSApplication` (this process) hosts every window, so the Dock/
+Cmd-Tab shows a single "wayland-macos". macOS ties Dock tiles and Cmd-Tab entries
+to *processes*, not windows, so the only way to show each app separately is one
+process per app. `--multiplex` does exactly that:
+
+- The compositor process becomes an `Accessory` app (no Dock tile, no Cmd-Tab)
+  and owns **no** `NSWindow`s. It still runs the Wayland engine, the clipboard
+  bridge, and an AppKit run loop.
+- It spawns one **window-host** child (`--window-host <sock>`) per Wayland client,
+  keyed by a stable `app_key` (`State::client_app_ids`). A host is a normal
+  `NSApplication` — `Regular` for toplevels (its own Dock tile / Cmd-Tab entry),
+  `Accessory` for a layer-shell bar.
+- Each host shows the **app's real name** (not "wayland-macos") in the Dock/Cmd-Tab.
+  macOS derives a non-bundled app's name from its *executable file name* (not
+  argv[0]), so `router::spawn_helper` execs the child through a symlink whose
+  basename is the app name — derived from `xdg_toplevel.set_app_id` (fallback:
+  title) by `app_display_name`. Verified via LaunchServices' `LSDisplayName`.
+- Each host also gets a **Dock icon**: the client's `xdg_toplevel_icon_v1` buffer
+  artwork when provided (→ `WinCmd::SetIcon` → `NSApplication.setApplicationIcon
+  Image:`), otherwise a generated identicon the host derives from its name at
+  startup (`host::identicon_bgra`). Themed-name icons can't be resolved on macOS,
+  so those keep the identicon.
+- The seam is unchanged: `mac::post(WinCmd)` normally hits the local GCD main
+  queue; with the router enabled it serializes the `WinCmd` and sends it to the
+  owning host (`src/router.rs` → `src/ipc.rs`), whose `handle()` runs the *same*
+  AppKit code as in-process. Input flows back as `InputEvent`s over the same
+  socket into the compositor's `InputBus`. Window ids are global, so they key
+  hosts unambiguously.
+
+Enable it with `WLMAC_MULTIPLEX=1 bash scripts/mac-side.sh` (or pass `--multiplex`
+to the binary directly). First-cut limitations, all documented in `router.rs`:
+cursor commands are broadcast to every host rather than routed to the focused
+one; frame pixels cross the socket as a plain copy (IOSurface zero-copy is a
+later optimization — the wire type already carries the `Vec<u8>`); and a host
+that stalls its socket read applies back-pressure to the Wayland thread.
+
 ## Source map
 
 | Path | Responsibility |
@@ -38,6 +76,9 @@ Linux app ──> waypipe (server, in container) ──TCP──> waypipe (clien
 | `src/mac.rs` | AppKit side: `WaylandView`/`WaylandWindow`/`WinDelegate`, `WinCmd` handling, drag/resize, cursors, keyboard-layout detection. |
 | `src/input.rs` | Cross-thread `InputBus`, `InputEvent`, and the shared `scale` / `output_size` atomics. |
 | `src/wayland/clipboard.rs` | Native macOS integration (the clipboard ↔ `wl_data_device`; its state lives on `State.clipboard`). |
+| `src/router.rs` | `--multiplex` mode (compositor side): spawns one *window-host* child per Wayland app and routes each `WinCmd` to the host owning the target window; feeds hosts' input back into the local `InputBus`. |
+| `src/host.rs` | `--multiplex` mode (child side): `--window-host <sock>` entry — its own `NSApplication` (its own Dock tile / Cmd-Tab entry) running the normal AppKit `handle()` path over a socket. |
+| `src/ipc.rs` | Wire format for the two above: length-prefixed `bincode` frames (`Downlink`/`Uplink`) over a `UnixStream`. |
 | `src/bin/testclient.rs` | Standalone `wayland-client` test client. |
 | `build.rs` | Points the linker at Homebrew's libxkbcommon. |
 | `docker/` | Container images + `entrypoint.sh` (see Containers). |
@@ -72,6 +113,7 @@ records, and all protocol/`wayland_server` imports.
 | `primary_selection.rs` | `zwp_primary_selection_v1` (X11-style middle-click paste, client-to-client only) |
 | `layer_shell.rs` | `zwlr_layer_shell_v1` (docked bars/panels + launchers → borderless floating NSWindow anchored to a screen edge; a keyboard-interactive surface like fuzzel is made key; see `create_layer_window`) |
 | `color_management.rs` | `wp_color_manager_v1` (HDR: PQ/HLG/sRGB transfer + BT.2020/Display-P3/sRGB primaries → a `ColorDesc` staged on the surface; see HDR below) |
+| `xdg_toplevel_icon.rs` | `xdg_toplevel_icon_v1` (per-toplevel icons; a buffer icon → `WinCmd::SetIcon` → the app's Dock icon in --multiplex mode; name-only icons fall back to the host's generated identicon) |
 
 ## Adding a new Wayland protocol
 

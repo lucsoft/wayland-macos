@@ -52,9 +52,16 @@ if [ ! -x "$WAYPIPE" ]; then
 fi
 
 # 1. compositor
-if ! pgrep -f "target/debug/wayland-macos" >/dev/null 2>&1; then
-    echo "[mac] starting compositor"
-    nohup "$ROOT/target/debug/wayland-macos" >"$COMP_LOG" 2>&1 &
+# WLMAC_MULTIPLEX=1 hides "wayland-macos" itself (no Dock tile / no Cmd-Tab) and
+# surfaces each Wayland app as its own native macOS app via per-app window-host
+# child processes (see src/router.rs).
+COMP_ARGS=""
+[ "${WLMAC_MULTIPLEX:-}" = "1" ] && COMP_ARGS="--multiplex"
+# The compositor is the wayland-macos process WITHOUT --window-host (those are the
+# per-app helpers spawned in multiplex mode).
+if ! pgrep -af "target/debug/wayland-macos" | grep -v "window-host" | grep -q .; then
+    echo "[mac] starting compositor ${COMP_ARGS}"
+    nohup "$ROOT/target/debug/wayland-macos" $COMP_ARGS >"$COMP_LOG" 2>&1 &
     echo $! >/tmp/wlmac-compositor.pid
     sleep 1
 else

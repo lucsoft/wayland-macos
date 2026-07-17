@@ -44,6 +44,12 @@ objc2-quartz-core = { version = "0.3", features = ["CALayer", "CATransaction", "
 dispatch2 = "0.3"
 memmap2 = "0.9"
 libc = "0.2"
+# --multiplex mode: WinCmd/InputEvent are serialized across the process boundary
+# between the compositor and the per-app "window host" helpers (src/ipc.rs).
+# bincode is compact for the raw pixel Vec<u8> a frame carries (JSON would balloon
+# it); hand-rolling a codec for ~25 WinCmd variants is where silent wire bugs hide.
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
 
 # Used only by the test client binary (src/bin/testclient.rs).
 wayland-client = "0.31"
