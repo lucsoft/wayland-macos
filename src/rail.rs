@@ -72,6 +72,7 @@ mod imp {
         cursor_hidden: extern "C" fn(*mut c_void),
         cursor_default: extern "C" fn(*mut c_void),
         log: extern "C" fn(*mut c_void, c_int, *const c_char),
+        window_icon: extern "C" fn(*mut c_void, u32, u32, u32, u32, *const u8),
     }
 
     extern "C" {
@@ -94,13 +95,6 @@ mod imp {
     /// destroy whatever is still live here (otherwise the NSWindows linger with
     /// a frozen last frame). Touched from the FreeRDP event-loop thread only.
     static LIVE_WINDOWS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-
-    /// Last known server-side position (RDP desktop offset) per window. weston
-    /// owns window placement and streams new offsets during an interactive move;
-    /// we mirror the *delta* onto the NSWindow (`WinCmd::MoveBy`). Keyed by
-    /// window id. Touched from the FreeRDP event-loop thread only.
-    static WIN_POS: Mutex<std::collections::BTreeMap<u32, (i32, i32)>> =
-        Mutex::new(std::collections::BTreeMap::new());
 
     fn cstr(p: *const c_char) -> String {
         if p.is_null() {
@@ -135,12 +129,6 @@ mod imp {
         let name = cstr(title);
         info!(target: "rail", "window create id={id} {w}x{h} title={name:?}");
         LIVE_WINDOWS.lock().unwrap().push(id);
-        // Seed the server-side position so the first move update yields a correct
-        // delta (the NSWindow keeps the compositor's own initial placement).
-        WIN_POS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id, (x, y));
         // --multiplex: give each RAIL toplevel its own per-app window-host (its
         // own Dock tile / Cmd-Tab entry). RAIL has no per-window app id in this
         // build, so key the host by the window id (one tile per window) and name
@@ -163,6 +151,10 @@ mod imp {
             title: cstr(title),
             geom: (0, 0, 0, 0),
         });
+        // Place at weston's chosen position so the mirror is aligned from the
+        // start (no jump on the first move, and weston's edges map to the
+        // screen's — see WinCmd::Move).
+        mac::post(WinCmd::Move { id, x, y });
     }
 
     extern "C" fn on_window_update(
@@ -174,19 +166,10 @@ mod imp {
         _h: u32,
     ) {
         // weston does a server-side interactive move: it owns the window position
-        // and streams new offsets here. Mirror the delta onto the NSWindow so it
+        // and streams new offsets here. Mirror them onto the NSWindow so it
         // follows the drag. (Size follows the next surface frame, which resizes
         // the NSWindow to the buffer, so we ignore w/h.)
-        let delta = {
-            let mut pos = WIN_POS.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = pos.insert(id, (x, y));
-            prev.map(|(px, py)| (x - px, y - py))
-        };
-        if let Some((dx, dy)) = delta {
-            if dx != 0 || dy != 0 {
-                mac::post(WinCmd::MoveBy { id, dx, dy });
-            }
-        }
+        mac::post(WinCmd::Move { id, x, y });
     }
 
     extern "C" fn on_window_title(_user: *mut c_void, id: u32, title: *const c_char) {
@@ -196,13 +179,35 @@ mod imp {
         });
     }
 
+    /// A RAIL window icon (32-bit BGRA). In --multiplex mode this becomes the
+    /// app's Dock icon (routed to the owning host); single-process it sets this
+    /// process's Dock icon. Apps without an icon never trigger this.
+    extern "C" fn on_window_icon(
+        _user: *mut c_void,
+        id: u32,
+        w: u32,
+        h: u32,
+        stride: u32,
+        pixels: *const u8,
+    ) {
+        if pixels.is_null() || w == 0 || h == 0 {
+            return;
+        }
+        let len = stride as usize * h as usize;
+        let pixels = unsafe { std::slice::from_raw_parts(pixels, len) }.to_vec();
+        debug!(target: "rail", "window icon id={id} {w}x{h}");
+        mac::post(WinCmd::SetIcon {
+            id,
+            width: w as i32,
+            height: h as i32,
+            stride: stride as i32,
+            pixels,
+        });
+    }
+
     extern "C" fn on_window_delete(_user: *mut c_void, id: u32) {
         info!(target: "rail", "window delete id={id}");
         LIVE_WINDOWS.lock().unwrap().retain(|&w| w != id);
-        WIN_POS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&id);
         mac::post(WinCmd::Destroy { id });
     }
 
@@ -377,6 +382,7 @@ mod imp {
                 cursor_hidden: on_cursor_hidden,
                 cursor_default: on_cursor_default,
                 log: on_log,
+                window_icon: on_window_icon,
             };
             let rc = unsafe {
                 rail_run(

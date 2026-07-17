@@ -57,6 +57,12 @@ typedef struct {
      * rail_bridge.c); `msg` is a NUL-terminated, already-formatted string valid
      * only for the duration of the call. May be NULL if Rust wired no logger. */
     void (*log)(void *user, int level, const char *msg);
+    /* A RAIL window's icon (decoded to 32-bit BGRA, `w`x`h` at `stride`
+     * bytes/row). Becomes the app's Dock icon in --multiplex mode. Valid only for
+     * the duration of the call. Apps without an icon (e.g. weston-terminal) never
+     * trigger this. */
+    void (*window_icon)(void *user, uint32_t id, uint32_t w, uint32_t h,
+                        uint32_t stride, const uint8_t *pixels);
 } rail_callbacks;
 
 /* Severities for rail_callbacks.log — mirror Rust's log::Level ordering. */

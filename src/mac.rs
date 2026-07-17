@@ -865,12 +865,13 @@ pub enum WinCmd {
     Title { id: u32, title: String },
     /// Begin an interactive drag of the window (from `xdg_toplevel.move`).
     StartMove { id: u32 },
-    /// Move a window by a delta in logical points (`dx` right, `dy` down). Used
-    /// by the RAIL back-end to mirror a server-side interactive move: weston owns
-    /// the window position and streams new offsets, so the NSWindow follows by
-    /// the same delta (relative avoids screen-origin conversion and any jump from
-    /// the compositor's own initial placement).
-    MoveBy { id: u32, dx: i32, dy: i32 },
+    /// Position a window at an absolute RDP desktop offset (`x`,`y` in logical
+    /// points, top-left origin). Used by the RAIL back-end to mirror weston's
+    /// server-side window placement/move: weston owns the position, so the
+    /// NSWindow tracks it exactly (converted to macOS' bottom-left origin). Absolute
+    /// (not relative) so weston's edges map to the screen's — the window can reach
+    /// the very top rather than being offset by the compositor's own placement.
+    Move { id: u32, x: i32, y: i32 },
     /// Begin an interactive resize on the given edges (from `xdg_toplevel.resize`).
     StartResize { id: u32, edges: u32 },
     /// Create a borderless popup window (menu/dropdown) positioned relative to
@@ -1460,15 +1461,21 @@ fn handle(cmd: WinCmd) {
                 }
             });
         }
-        WinCmd::MoveBy { id, dx, dy } => {
+        WinCmd::Move { id, x, y } => {
             WINDOWS.with(|w| {
                 if let Some(e) = w.borrow().get(&id) {
-                    let f = e.window.frame();
-                    // RDP y grows downward, macOS upward — flip dy.
-                    e.window.setFrameOrigin(CGPoint::new(
-                        f.origin.x + dx as f64,
-                        f.origin.y - dy as f64,
-                    ));
+                    // Map the RDP desktop offset (top-left origin, y down) onto the
+                    // window's screen (macOS: bottom-left origin, y up). The RAIL
+                    // desktop is single-output, so fall back to the main screen.
+                    let screen = e.window.screen().or_else(|| NSScreen::mainScreen(mtm));
+                    if let Some(screen) = screen {
+                        let sf = screen.frame();
+                        let wf = e.window.frame();
+                        e.window.setFrameOrigin(CGPoint::new(
+                            sf.origin.x + x as f64,
+                            sf.origin.y + sf.size.height - y as f64 - wf.size.height,
+                        ));
+                    }
                 }
             });
         }

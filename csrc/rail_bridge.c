@@ -554,6 +554,32 @@ static BOOL rail_pre_connect(freerdp *instance) {
     return TRUE;
 }
 
+/* A RAIL window icon: decode the DIB (color bits + AND mask, palette for low
+ * bpp) to BGRA and hand it to Rust as the app's Dock icon. Apps that set no icon
+ * (e.g. weston-terminal) never send this order. */
+static BOOL rail_window_icon(rdpContext *context, const WINDOW_ORDER_INFO *oi,
+                             const WINDOW_ICON_ORDER *wi) {
+    (void)context;
+    if (!wi || !wi->iconInfo || !g_cb.window_icon)
+        return TRUE;
+    ICON_INFO *ic = wi->iconInfo;
+    if (ic->width == 0 || ic->height == 0)
+        return TRUE;
+    uint32_t w = ic->width, h = ic->height, stride = w * 4;
+    BYTE *buf = (BYTE *)calloc(1, (size_t)stride * h);
+    if (!buf)
+        return TRUE;
+    if (freerdp_image_copy_from_icon_data(
+            buf, PIXEL_FORMAT_BGRA32, stride, 0, 0, (UINT16)w, (UINT16)h,
+            ic->bitsColor, (UINT16)ic->cbBitsColor, ic->bitsMask,
+            (UINT16)ic->cbBitsMask, ic->colorTable, (UINT16)ic->cbColorTable,
+            ic->bpp)) {
+        g_cb.window_icon(g_cb.user, oi->windowId, w, h, stride, buf);
+    }
+    free(buf);
+    return TRUE;
+}
+
 static BOOL rail_post_connect(freerdp *instance) {
     rdpContext *ctx = instance->context;
     if (!gdi_init(instance, PIXEL_FORMAT_BGRA32))
@@ -568,6 +594,7 @@ static BOOL rail_post_connect(freerdp *instance) {
     update->window->WindowCreate = rail_window_create;
     update->window->WindowUpdate = rail_window_update;
     update->window->WindowDelete = rail_window_delete;
+    update->window->WindowIcon = rail_window_icon;
     return TRUE;
 }
 
