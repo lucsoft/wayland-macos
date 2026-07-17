@@ -35,6 +35,10 @@ pub enum Downlink {
         regular: bool,
         /// Human-facing app name for the Dock/Cmd-Tab entry.
         name: String,
+        /// RAIL back-end: the host must keep its windows non-resizable (the app's
+        /// CSD titlebar sits at the top edge; a native Resizable window would
+        /// steal titlebar drags — see `mac::RAIL_MODE`).
+        rail: bool,
     },
     /// A window operation to run on this host's AppKit main thread.
     Cmd(WinCmd),

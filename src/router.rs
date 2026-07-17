@@ -50,6 +50,9 @@ struct Router {
     out_w: i32,
     out_h: i32,
     insets: (i32, i32, i32, i32),
+    /// RAIL back-end active — forwarded to hosts so their windows stay
+    /// non-resizable (see `mac::RAIL_MODE`).
+    rail: bool,
     helpers: HashMap<u32, Helper>,
     /// window id → owning app_key.
     win_to_app: HashMap<u32, u32>,
@@ -75,6 +78,7 @@ pub fn enable(bus: Arc<InputBus>, scale: i32, out_w: i32, out_h: i32) {
         out_w,
         out_h,
         insets: crate::input::reserved_insets(),
+        rail: crate::mac::RAIL_MODE.load(std::sync::atomic::Ordering::Relaxed),
         helpers: HashMap::new(),
         win_to_app: HashMap::new(),
         bus,
@@ -264,6 +268,7 @@ fn spawn_helper(app_key: u32, name: &str, regular: bool, r: &Router) -> Option<H
             insets: r.insets,
             regular,
             name: name.to_string(),
+            rail: r.rail,
         },
     )
     .is_err()

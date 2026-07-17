@@ -62,6 +62,9 @@ fn main() {
     // (Weston composites in the container, we draw its RAIL windows). Both sit
     // behind the same WinCmd/InputBus seam — see `src/rail.rs`.
     let use_rail = args.iter().any(|a| a == "--use-microsoft-rail-protocol");
+    // Record the back-end early: the router (multiplex, below) reads it to tell
+    // each host to keep RAIL windows non-resizable.
+    mac::RAIL_MODE.store(use_rail, std::sync::atomic::Ordering::Relaxed);
 
     // --multiplex: hide "wayland-macos" itself and surface each Wayland app as
     // its own native macOS app (see src/router.rs). The compositor becomes an
@@ -127,7 +130,6 @@ fn main() {
     // operations back to AppKit via the main GCD queue.
     if use_rail {
         info!(target: "wl", "back-end = RAIL (--use-microsoft-rail-protocol)");
-        mac::RAIL_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
         std::thread::Builder::new()
             .name("rail".into())
             .spawn(move || rail::run(bus))

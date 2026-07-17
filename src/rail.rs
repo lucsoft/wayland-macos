@@ -122,8 +122,16 @@ mod imp {
         if w == 0 || h == 0 {
             return;
         }
-        info!(target: "rail", "window create id={id} {w}x{h} title={:?}", cstr(title));
+        let name = cstr(title);
+        info!(target: "rail", "window create id={id} {w}x{h} title={name:?}");
         LIVE_WINDOWS.lock().unwrap().push(id);
+        // --multiplex: give each RAIL toplevel its own per-app window-host (its
+        // own Dock tile / Cmd-Tab entry). RAIL has no per-window app id in this
+        // build, so key the host by the window id (one tile per window) and name
+        // it from the title (fallback to the RemoteApp program). A no-op when the
+        // router is disabled, so this is safe to call unconditionally.
+        let display = if name.is_empty() { "weston-terminal" } else { &name };
+        mac::assign_window(id, id, display, true);
         mac::post(WinCmd::Create {
             id,
             width: w as i32,

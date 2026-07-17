@@ -46,10 +46,12 @@ pub fn run_window_host(sock_path: &str) -> ! {
             insets,
             regular,
             name,
+            rail,
         } => {
             crate::input::set_scale(scale);
             crate::input::set_output_size(out_w, out_h);
             crate::input::set_reserved_insets(insets.0, insets.1, insets.2, insets.3);
+            crate::mac::RAIL_MODE.store(rail, std::sync::atomic::Ordering::Relaxed);
             (regular, name)
         }
         _ => panic!("[host] first frame was not Hello"),
