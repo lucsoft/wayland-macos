@@ -172,10 +172,12 @@ impl Dispatch<WlSubcompositor, ()> for State {
             parent,
         } = request
         {
+            let sub = data_init.init(id, ());
             // The spec forbids a surface being its own parent (a subsurface
             // cycle); reject it here rather than let it hang the parent-chain
             // walk in resolve_subsurface. wlroots/Smithay likewise raise
-            // bad_surface at get_subsurface time.
+            // bad_surface at get_subsurface time. The object is left inert (never
+            // inserted into the maps); the protocol error disconnects the client.
             if surface.id() == parent.id() {
                 resource.post_error(
                     wl_subcompositor::Error::BadSurface,
@@ -183,7 +185,6 @@ impl Dispatch<WlSubcompositor, ()> for State {
                 );
                 return;
             }
-            let sub = data_init.init(id, ());
             let sub_id = state.alloc_window_id();
             state.subsurfaces.insert(
                 sub.id(),

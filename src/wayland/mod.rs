@@ -152,7 +152,7 @@ impl PoolMem {
             return;
         }
         match unsafe { MmapOptions::new().len(size as usize).map(&self.fd) } {
-            Ok(m) => *self.map.write().unwrap() = Some(m),
+            Ok(m) => *self.map.write().unwrap_or_else(|e| e.into_inner()) = Some(m),
             Err(e) => eprintln!("[wl] warning: failed to remap shm pool ({size} bytes): {e}"),
         }
     }
@@ -214,7 +214,7 @@ fn buffer_to_pixels(buffer: &WlBuffer) -> Option<(i32, i32, i32, Vec<u8>)> {
             let len = strd.checked_mul(h)?;
             let end = off.checked_add(len)?;
             let mut pixels = vec![0u8; len];
-            let guard = pool.map.read().unwrap();
+            let guard = pool.map.read().unwrap_or_else(|e| e.into_inner());
             let map = guard.as_ref()?;
             if end > map.len() {
                 return None;
@@ -1510,14 +1510,14 @@ mod tests {
             .create(true)
             .truncate(true)
             .open(&path)
-            .unwrap();
-        file.write_all(&[0u8; 8192]).unwrap();
-        file.flush().unwrap();
+            .expect("open temp pool file");
+        file.write_all(&[0u8; 8192]).expect("write pool backing bytes");
+        file.flush().expect("flush pool file");
         let _ = std::fs::remove_file(&path); // unlink; the fd stays valid
 
         let fd = OwnedFd::from(file);
         let pool = map_pool(fd, 4096);
-        let len = |p: &PoolMem| p.map.read().unwrap().as_ref().map(|m| m.len());
+        let len = |p: &PoolMem| p.map.read().unwrap_or_else(|e| e.into_inner()).as_ref().map(|m| m.len());
         assert_eq!(len(&pool), Some(4096), "initial mapping matches create size");
 
         // Grow the pool: resize must re-map at the new (larger) length.
@@ -1637,6 +1637,8 @@ mod harness_tests {
         pointer_events: Vec<PtrEv>,
         /// Token string echoed back via `xdg_activation_token_v1.done`.
         activation_token: Option<String>,
+        /// `(width, height)` of every `xdg_toplevel.configure` the client received.
+        toplevel_configures: Vec<(i32, i32)>,
     }
 
     /// The bound client proxies plus its connection/queue/state.
@@ -1826,12 +1828,45 @@ mod harness_tests {
             let _ = std::fs::remove_file(&path); // unlink; the fd stays valid
             file.set_len(file_size as u64).expect("set_len");
 
-            let c = self.client.as_mut().unwrap();
+            let c = self.client.as_mut().expect("client still connected");
             let pool: WlShmPool = c.shm.create_pool(file.as_fd(), pool_size, &c.qh, ());
             if let Some(rs) = resize_to {
                 pool.resize(rs);
             }
             let buffer = pool.create_buffer(offset, w, h, stride, wl_shm::Format::Xrgb8888, &c.qh, ());
+            self.keep_files.push(file);
+            buffer
+        }
+
+        /// Like `shm_buffer`, but fills the buffer with `bytes` first so a test can
+        /// snapshot the exact pixels the compositor forwards. `bytes` is the raw
+        /// buffer content (XRGB8888 little-endian == memory order B,G,R,X); its
+        /// length must be `w*4*h`. The pool is mapped MAP_SHARED, so a write to the
+        /// backing fd here is what `buffer_to_pixels` reads on commit.
+        fn shm_buffer_filled(&mut self, w: i32, h: i32, bytes: &[u8]) -> WlBuffer {
+            use std::os::unix::fs::FileExt;
+            let stride = w * 4;
+            assert_eq!(bytes.len(), (stride * h) as usize, "pixel data must be w*4*h");
+            let file_size = (stride * h).max(1);
+
+            let seq = FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let mut path = std::env::temp_dir();
+            path.push(format!("wlmac-harness-fill-{}-{}", std::process::id(), seq));
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .expect("open shm file");
+            let _ = std::fs::remove_file(&path); // unlink; the fd stays valid
+            file.set_len(file_size as u64).expect("set_len");
+            file.write_all_at(bytes, 0).expect("write pixel pattern");
+
+            let c = self.client.as_mut().expect("client still connected");
+            let pool: WlShmPool = c.shm.create_pool(file.as_fd(), file_size, &c.qh, ());
+            let buffer =
+                pool.create_buffer(0, w, h, stride, wl_shm::Format::Xrgb8888, &c.qh, ());
             self.keep_files.push(file);
             buffer
         }
@@ -1963,6 +1998,50 @@ mod harness_tests {
         assert_eq!(pixels, vec![0, 0, 255, 255], "opaque red as BGRA bytes");
     }
 
+    // === Headless render → snapshot ====================================
+
+    /// End-to-end proof that the "client renders → compositor → pixels handed to
+    /// AppKit" path is snapshot-testable with no NSWindow, display, or GPU: a
+    /// client fills a 2x2 shm buffer with four known colours and commits; the
+    /// bytes that reach the AppKit seam via `WinCmd::Frame` must match the client's
+    /// buffer exactly. Swap the `assert_eq!` for a golden-file / `insta` snapshot
+    /// (or hash a larger buffer) to grow this into a real image-diff suite.
+    #[test]
+    fn shm_buffer_frame_pixels_snapshot() {
+        let mut h = Harness::new();
+        let (surface, _xdg, _tl) = h.make_toplevel();
+
+        // XRGB8888 is little-endian, so a pixel is [B, G, R, X] in memory.
+        let px = |b, g, r| [b, g, r, 0u8];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&px(0, 0, 255)); // top-left: red
+        bytes.extend_from_slice(&px(0, 255, 0)); // top-right: green
+        bytes.extend_from_slice(&px(255, 0, 0)); // bottom-left: blue
+        bytes.extend_from_slice(&px(255, 255, 255)); // bottom-right: white
+
+        let buf = h.shm_buffer_filled(2, 2, &bytes);
+        surface.attach(Some(&buf), 0, 0);
+        surface.commit();
+        h.pump();
+
+        let cmds = h.cmds();
+        let (w, hgt, stride, pixels) = cmds
+            .iter()
+            .find_map(|c| match c {
+                WinCmd::Frame { width, height, stride, pixels, .. } => {
+                    Some((*width, *height, *stride, pixels.clone()))
+                }
+                _ => None,
+            })
+            .expect("a Frame was emitted");
+
+        assert_eq!((w, hgt, stride), (2, 2, 8), "Frame carries the buffer geometry");
+        assert_eq!(
+            pixels, bytes,
+            "output pixels match the client's rendered buffer byte-for-byte"
+        );
+    }
+
     // === Regression #3: wp_viewport.set_destination ====================
 
     /// A toplevel with a tiny buffer but a viewport destination of 1280x800 must
@@ -2065,6 +2144,41 @@ mod harness_tests {
             matches!(c, WinCmd::SubDestroy { window_id, .. } if *window_id == parent_window)
         });
         assert!(destroyed, "subsurface destroy emits SubDestroy for the parent");
+    }
+
+    /// A subsurface cycle (A's parent is B, B's parent is A — neither ever
+    /// reaching a root window) must not hang `resolve_subsurface`. The spec
+    /// forbids cycles, but a malformed client can still build one; without a
+    /// visited-set guard the parent-chain walk loops forever, freezing the whole
+    /// wayland thread (every client + all input). Committing into the cycle must
+    /// return promptly and present nothing. If this test hangs, the guard is gone.
+    #[test]
+    fn subsurface_cycle_does_not_hang() {
+        let mut h = Harness::new();
+        // No toplevel: neither surface resolves to a window, so the walk can only
+        // terminate via the cycle guard.
+        let (a, _sub_ab, _sub_ba) = {
+            let c = h.client();
+            let a = c.compositor.create_surface(&c.qh, ());
+            let b = c.compositor.create_surface(&c.qh, ());
+            // A's parent is B, B's parent is A. Each has surface != parent, so the
+            // creation-time self-parent guard does not fire — this exercises the
+            // walk's own cycle detection.
+            let sub_ab: WlSubsurface = c.subcompositor.get_subsurface(&a, &b, &c.qh, ());
+            let sub_ba: WlSubsurface = c.subcompositor.get_subsurface(&b, &a, &c.qh, ());
+            (a, sub_ab, sub_ba)
+        };
+        let buf = h.shm_buffer(4096, None, 0, 8, 8);
+        a.attach(Some(&buf), 0, 0);
+        a.commit();
+        h.pump(); // must return; the bug would spin here forever
+
+        let cmds = h.cmds();
+        assert_eq!(
+            count(&cmds, |c| matches!(c, WinCmd::SubFrame { .. })),
+            0,
+            "a cyclic subsurface resolves to no window and presents nothing"
+        );
     }
 
     // === Regression #5: enter-before-motion (prevents a KWin crash) =====
@@ -2244,6 +2358,81 @@ mod harness_tests {
         assert!(formats.contains(&xrgb), "shm advertises Xrgb8888");
     }
 
+    // === Resize never outruns the buffer (no black regions) =============
+
+    /// The headless equivalent of "resize a nested KWin window to double the
+    /// height and expect no black areas". A resize (from a frame drag or a nested
+    /// KWin session) must ask the *client* to repaint at the new size and must NOT
+    /// grow the presented surface until the matching buffer arrives — if the
+    /// window grew ahead of its buffer, the uncovered region would paint black.
+    /// This drives the same `WinCmd`/input seam KWin would, so it catches the
+    /// black-area regression deterministically without Docker, a GUI session, or
+    /// a screenshot (see scripts/e2e-resize-kwin.sh for the real-KWin smoke test).
+    #[test]
+    fn resize_asks_client_to_repaint_before_growing_window() {
+        let mut h = Harness::new();
+        let (surface, _xdg, _tl) = h.make_toplevel();
+
+        // Map at 400x300.
+        let (w0, h0) = (400i32, 300i32);
+        let buf0 = h.shm_buffer(w0 * 4 * h0, None, 0, w0, h0);
+        surface.attach(Some(&buf0), 0, 0);
+        surface.commit();
+        h.pump();
+        assert!(
+            h.cmds().iter().any(|c| {
+                matches!(c, WinCmd::Frame { width, height, .. } if *width == w0 && *height == h0)
+            }),
+            "window maps at the initial buffer size"
+        );
+        let window_id = h.only_window_id();
+
+        // Double the height, exactly as mac.rs does on a frame drag / KWin resize.
+        let (w1, h1) = (400i32, 600i32);
+        let dh = h.dh.clone();
+        h.state
+            .process_input(&dh, InputEvent::Resize { window_id, width: w1, height: h1 });
+        h.pump();
+
+        // (a) The client was asked to repaint at the doubled size.
+        assert!(
+            h.client().cstate.toplevel_configures.contains(&(w1, h1)),
+            "client received a configure at the doubled size; got {:?}",
+            h.client().cstate.toplevel_configures
+        );
+        // (b) Nothing is presented yet: the window must not grow ahead of a real
+        //     buffer. That uncovered gap is exactly what renders black.
+        assert_eq!(
+            count(&h.cmds(), |c| matches!(
+                c,
+                WinCmd::Frame { .. } | WinCmd::Create { .. }
+            )),
+            0,
+            "no frame presented until the client repaints — the window never \
+             outruns its buffer, so there is no black region"
+        );
+
+        // (c) The client repaints at the new size; the frame follows the buffer
+        //     exactly (no stretch, no black margin).
+        let buf1 = h.shm_buffer(w1 * 4 * h1, None, 0, w1, h1);
+        surface.attach(Some(&buf1), 0, 0);
+        surface.commit();
+        h.pump();
+        let frame = h
+            .cmds()
+            .into_iter()
+            .find_map(|c| match c {
+                WinCmd::Frame { width, height, .. } => Some((width, height)),
+                _ => None,
+            })
+            .expect("a Frame after the client repaints");
+        assert_eq!(
+            frame,
+            (w1, h1),
+            "the presented frame follows the client's new taller buffer exactly"
+        );
+    }
+
     // --- client-side Dispatch impls --------------------------------------
 
     impl Dispatch<WlRegistry, ()> for CState {
@@ -2354,6 +2543,28 @@ mod harness_tests {
         }
     }
 
+    /// Records the size the compositor asks the toplevel to adopt, so a resize
+    /// test can assert the client was told to repaint at the new dimensions.
+    impl Dispatch<XdgToplevel, ()> for CState {
+        fn event(
+            state: &mut Self,
+            _: &XdgToplevel,
+            event: wayland_protocols::xdg::shell::client::xdg_toplevel::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let wayland_protocols::xdg::shell::client::xdg_toplevel::Event::Configure {
+                width,
+                height,
+                ..
+            } = event
+            {
+                state.toplevel_configures.push((width, height));
+            }
+        }
+    }
+
     // Interfaces whose events the tests don't care about.
     wayland_client::delegate_noop!(CState: ignore WlCompositor);
     wayland_client::delegate_noop!(CState: ignore WlSurface);
@@ -2361,7 +2572,6 @@ mod harness_tests {
     wayland_client::delegate_noop!(CState: ignore WlBuffer);
     wayland_client::delegate_noop!(CState: ignore WlSubcompositor);
     wayland_client::delegate_noop!(CState: ignore WlSubsurface);
-    wayland_client::delegate_noop!(CState: ignore XdgToplevel);
     wayland_client::delegate_noop!(CState: ignore WpViewporter);
     wayland_client::delegate_noop!(CState: ignore WpViewport);
     wayland_client::delegate_noop!(CState: ignore WpSinglePixelBufferManagerV1);

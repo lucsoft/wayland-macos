@@ -102,19 +102,19 @@ impl InputBus {
 
     /// The Wayland thread registers the write end of its wakeup pipe here.
     pub fn set_waker(&self, fd: OwnedFd) {
-        *self.waker.lock().unwrap() = Some(fd);
+        *self.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(fd);
     }
 
     /// Called from the AppKit main thread.
     pub fn push(&self, ev: InputEvent) {
-        self.queue.lock().unwrap().push_back(ev);
-        if let Some(fd) = self.waker.lock().unwrap().as_ref() {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner()).push_back(ev);
+        if let Some(fd) = self.waker.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let _ = rustix::io::write(fd, &[1u8]);
         }
     }
 
     /// Called from the Wayland thread after the pipe wakes it.
     pub fn drain(&self) -> Vec<InputEvent> {
-        self.queue.lock().unwrap().drain(..).collect()
+        self.queue.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect()
     }
 }

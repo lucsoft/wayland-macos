@@ -1134,13 +1134,13 @@ static POST_SINK: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::mpsc::S
 #[allow(dead_code)]
 pub fn set_post_sink(tx: std::sync::mpsc::Sender<WinCmd>) {
     let cell = POST_SINK.get_or_init(|| std::sync::Mutex::new(None));
-    *cell.lock().unwrap() = Some(tx);
+    *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
 }
 
 /// Enqueue a window command onto the AppKit main thread.
 pub fn post(cmd: WinCmd) {
     if let Some(m) = POST_SINK.get() {
-        if let Some(tx) = m.lock().unwrap().as_ref() {
+        if let Some(tx) = m.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let _ = tx.send(cmd);
             return;
         }
@@ -1397,6 +1397,20 @@ fn csd_margin(width: i32, height: i32, dst_w: i32, dst_h: i32, geom: (i32, i32, 
     }
     let (bw, bh) = ((width / scale).max(1), (height / scale).max(1));
     ((bw - gw).max(0), (bh - gh).max(0))
+}
+
+/// Origin (in the parent view's y-up layer space) for a subsurface placed at the
+/// Wayland top-left offset `(x, y)` with logical size `lh` tall, inside a window
+/// `win_h` points tall. Wayland's y grows downward and the layer's grows upward,
+/// so y is flipped against the window height.
+///
+/// `win_h` MUST be the window's *live* height. A stale height (e.g. a decorated
+/// window's cached size, which `present_frame` intentionally stops updating during
+/// a user resize) mis-places the sublayer: KWin draws its whole desktop into one
+/// full-output subsurface, so if it lands low the newly-exposed top of the window
+/// is left uncovered and shows the black root layer — the "black bar on resize".
+fn subsurface_origin(win_h: f64, x: i32, y: i32, lh: f64) -> (f64, f64) {
+    (x as f64, win_h - y as f64 - lh)
 }
 
 fn create_window(
@@ -1871,7 +1885,11 @@ fn present_subframe(
         let mut map = w.borrow_mut();
         let Some(entry) = map.get_mut(&window_id) else { return };
         let Some(root) = entry.view.layer() else { return };
-        let win_h = entry.cur_h as f64;
+        // Use the LIVE view height, not the cached cur_h: for a server-decorated
+        // window (KWin) present_frame stops maintaining cur_h during a user resize,
+        // so cur_h goes stale and the subsurface would be flipped against the wrong
+        // height — leaving a black bar where KWin's output no longer reaches.
+        let win_h = entry.view.bounds().size.height;
 
         let sublayer = entry
             .sublayers
@@ -1884,7 +1902,7 @@ fn present_subframe(
             .clone();
 
         // Wayland (x,y) is a top-left offset; the view's layer is y-up.
-        let oy = win_h - y as f64 - lh;
+        let (_, oy) = subsurface_origin(win_h, x, y, lh);
         let img_ptr: *const CGImage = &*image;
         let obj: &AnyObject = unsafe { &*(img_ptr as *const AnyObject) };
         // Disable implicit animations so a moving/updating subsurface (e.g. KWin's
@@ -1940,4 +1958,55 @@ fn make_cgimage(
     }
 
     CGBitmapContextCreateImage(Some(&ctx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{csd_margin, logical_size, subsurface_origin};
+
+    /// A `wp_viewport` destination wins over the buffer size; otherwise the buffer
+    /// is divided by the output scale.
+    #[test]
+    fn logical_size_prefers_viewport_then_scales_buffer() {
+        assert_eq!(logical_size(2, 2, 1280, 800, 2), (1280.0, 800.0));
+        assert_eq!(logical_size(800, 600, 0, 0, 2), (400.0, 300.0));
+    }
+
+    /// CSD margin is the buffer minus the client's window geometry, and is zero
+    /// when a viewport is in use or no geometry was set.
+    #[test]
+    fn csd_margin_is_buffer_minus_geometry() {
+        // 420x320 buffer, 400x300 content geometry, scale 1 -> 20x20 shadow.
+        assert_eq!(csd_margin(420, 320, 0, 0, (10, 10, 400, 300), 1), (20, 20));
+        // Viewport in use -> no margin.
+        assert_eq!(csd_margin(420, 320, 1280, 800, (10, 10, 400, 300), 1), (0, 0));
+    }
+
+    /// Regression for the "black bar on resize" bug (KWin renders its whole
+    /// desktop into one full-output subsurface). With the *live* window height, a
+    /// full-output subsurface at (0,0) covers the window exactly — no black gap.
+    /// With a *stale* (pre-resize) height it lands low and leaves the top
+    /// uncovered, which is what showed the black bar. This pins the invariant the
+    /// AppKit `present_subframe` must satisfy; the real on-screen check is
+    /// scripts/e2e-resize-kwin.sh.
+    #[test]
+    fn subsurface_full_output_covers_resized_window() {
+        // Window doubled to 600pt tall; KWin repaints its output at the new size.
+        let win_h = 600.0;
+        let (ox, oy) = subsurface_origin(win_h, 0, 0, 600.0);
+        assert_eq!((ox, oy), (0.0, 0.0), "full-output subsurface sits at the origin");
+        // Covered vertical span is [oy, oy + lh]; it must span the whole window.
+        assert!(
+            oy <= 0.0 && oy + 600.0 >= win_h,
+            "the subsurface covers the full window height (no black gap)"
+        );
+
+        // The bug: flipping the same full-output subsurface against the stale
+        // pre-resize height (300) leaves [300, 600] at the top uncovered -> black.
+        let (_, oy_stale) = subsurface_origin(300.0, 0, 0, 600.0);
+        assert!(
+            oy_stale + 600.0 < win_h,
+            "a stale height leaves an uncovered (black) region at the top"
+        );
+    }
 }
