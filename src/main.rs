@@ -51,7 +51,7 @@ fn main() {
     let bus = Arc::new(input::InputBus::new());
     mac::set_input_bus(bus.clone());
 
-    // Watch the macOS pasteboard so the clipboard bridge can mirror it to
+    // Watch the macOS pasteboard so the clipboard integration can mirror it to
     // Wayland clients (paste direction).
     mac::start_clipboard_watch(bus.clone());
 

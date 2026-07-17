@@ -121,15 +121,15 @@ pub fn macos_keyboard_layout() -> Option<String> {
     Some(xkb.to_string())
 }
 
-// --- Clipboard bridge (NSPasteboard <-> the clipboard bridge) ---------------
+// --- Clipboard (NSPasteboard <-> the Wayland selection) ---------------------
 //
-// The clipboard bridge (see `wayland::clipboard`) owns the Wayland side. Here we
-// only touch `NSPasteboard`, always on the main thread:
+// The clipboard integration (see `wayland::clipboard`) owns the Wayland side.
+// Here we only touch `NSPasteboard`, always on the main thread:
 //
-//  * `set_clipboard` writes text the bridge pulled from a Wayland client.
+//  * `set_clipboard` writes text pulled from a Wayland client.
 //  * `start_clipboard_watch` polls `changeCount` and, when the pasteboard
-//    changes, pushes the new text onto the input bus so the bridge can offer it
-//    to Wayland clients.
+//    changes, pushes the new text onto the input bus so the Wayland side can
+//    offer it to clients.
 //
 // Both run on the main thread, so pasteboard access is serialized. The polling
 // interval — a compromise between latency and idle wakeups.
@@ -146,7 +146,7 @@ thread_local! {
 }
 
 /// Write `text` to the macOS pasteboard (marshalled to the main thread).
-/// Called by the clipboard bridge when a Wayland client copies.
+/// Called by the clipboard integration when a Wayland client copies.
 pub fn set_clipboard(text: String) {
     DispatchQueue::main().exec_async(move || {
         let pb = NSPasteboard::generalPasteboard();

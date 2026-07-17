@@ -1,5 +1,5 @@
-//! Clipboard bridge: connects the Wayland selection (`wl_data_device`) to the
-//! macOS pasteboard (`NSPasteboard`).
+//! Clipboard: connects the Wayland selection (`wl_data_device`) to the macOS
+//! pasteboard (`NSPasteboard`).
 //!
 //! Two directions, both routed through the macOS pasteboard so that even
 //! Wayland-to-Wayland copy/paste works consistently:
@@ -16,7 +16,7 @@
 //!   to every client. When a client pastes (`wl_data_offer.receive`) we write
 //!   the snapshot into the client's pipe.
 //!
-//! Only plain UTF-8 text is bridged; every advertised MIME maps to the same
+//! Only plain UTF-8 text is forwarded; every advertised MIME maps to the same
 //! bytes. Drag-and-drop (`start_drag`) is not handled.
 
 use std::collections::HashMap;
@@ -53,7 +53,7 @@ pub struct OfferData {
     bytes: Vec<u8>,
 }
 
-/// State of the clipboard bridge. Lives on `state.clipboard`.
+/// State of the clipboard integration. Lives on `state.clipboard`.
 #[derive(Default)]
 pub struct Clipboard {
     /// Live client data devices; new selections are advertised to each.

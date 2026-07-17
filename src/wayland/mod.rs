@@ -482,9 +482,9 @@ pub struct State {
     layer_surfaces: HashMap<ObjectId, LayerSurfaceRec>,
     /// wl_surface id -> its zwlr_layer_surface object.
     surface_layer: HashMap<ObjectId, ObjectId>,
-    /// Clipboard bridge: `wl_data_device` selection ⇆ the macOS `NSPasteboard`.
+    /// Clipboard: `wl_data_device` selection ⇆ the macOS `NSPasteboard`.
     pub(crate) clipboard: clipboard::Clipboard,
-    /// X11-style primary (middle-click) selection, bridged client-to-client only.
+    /// X11-style primary (middle-click) selection, client-to-client only.
     primary_selection: primary_selection::PrimarySelection,
     /// `wp_image_description_v1` object id -> the resolved color description it
     /// represents. A surface references one of these via `set_image_description`.
@@ -1283,7 +1283,7 @@ impl State {
                 mac::post(WinCmd::SetGrab { window: None });
             }
             // TODO(clipboard): placeholder so the build stays exhaustive; the
-            // pasteboard->selection bridge logic lives elsewhere / is WIP.
+            // pasteboard->selection logic lives elsewhere / is WIP.
             InputEvent::MacClipboard { .. } => {}
         }
     }
@@ -1490,7 +1490,7 @@ pub fn run(bus: Arc<InputBus>) {
             while rustix::io::read(&wake_r, &mut buf).unwrap_or(0) > 0 {}
             for ev in bus.drain() {
                 match ev {
-                    // The macOS pasteboard changed: let the clipboard bridge
+                    // The macOS pasteboard changed: let the clipboard
                     // re-advertise it to Wayland clients.
                     InputEvent::MacClipboard { text } => {
                         state.clipboard.set_mac_selection(&dh, text);

@@ -37,7 +37,7 @@ Linux app ──> waypipe (server, in container) ──TCP──> waypipe (clien
 | `src/wayland/*.rs` | One file per protocol family — the `Dispatch`/`GlobalDispatch` impls (see below). |
 | `src/mac.rs` | AppKit side: `WaylandView`/`WaylandWindow`/`WinDelegate`, `WinCmd` handling, drag/resize, cursors, keyboard-layout detection. |
 | `src/input.rs` | Cross-thread `InputBus`, `InputEvent`, and the shared `scale` / `output_size` atomics. |
-| `src/wayland/clipboard.rs` | Native macOS service bridge (the clipboard ↔ `wl_data_device`; its state lives on `State.clipboard`). |
+| `src/wayland/clipboard.rs` | Native macOS integration (the clipboard ↔ `wl_data_device`; its state lives on `State.clipboard`). |
 | `src/bin/testclient.rs` | Standalone `wayland-client` test client. |
 | `build.rs` | Points the linker at Homebrew's libxkbcommon. |
 | `docker/` | Container images + `entrypoint.sh` (see Containers). |
@@ -135,8 +135,9 @@ Pulse sinks/sources and listens on TCP 4713; the container's `entrypoint.sh` set
 Dockerfiles ship the PulseAudio client libs (`pulseaudio-utils`; the Debian image
 adds `gstreamer1.0-pulseaudio` for Qt/GTK media). It's optional and degrades
 cleanly: no `pulseaudio` on the Mac (`brew install pulseaudio`) → `mac-side.sh`
-prints a hint and apps start muted; nothing else breaks. This is not a `bridge/`
-(those live on the Wayland socket) — it bypasses waypipe entirely.
+prints a hint and apps start muted; nothing else breaks. This is not a native
+macOS integration (those live on the Wayland socket) — it bypasses waypipe
+entirely.
 
 ## Containers
 

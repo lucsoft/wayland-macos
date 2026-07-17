@@ -2,11 +2,11 @@
 //!
 //! The primary selection is a second, implicit clipboard: selecting text arms
 //! it, a middle-click pastes it. Many Linux apps rely on it. macOS has no
-//! equivalent, so this is a purely client-to-client bridge — the selection is
-//! offered among Wayland clients and never touches the macOS pasteboard (that is
-//! what `src/wayland/clipboard.rs` does for the regular `wl_data_device`).
+//! equivalent, so this is purely client-to-client — the selection is offered
+//! among Wayland clients and never touches the macOS pasteboard (that is what
+//! `src/wayland/clipboard.rs` does for the regular `wl_data_device`).
 //!
-//! The flow mirrors the clipboard bridge: a client offers a `..._source_v1` and
+//! The flow mirrors the clipboard: a client offers a `..._source_v1` and
 //! makes it the selection with `set_selection`; we advertise a fresh
 //! `..._offer_v1` to every client's device; when a client pastes
 //! (`offer.receive`) we ask the owning source to write the bytes into the pasted
@@ -116,8 +116,8 @@ impl PrimarySelection {
         device.selection(Some(&offer));
     }
 
-    /// Called by the Wayland loop right after `flush_clients` (see the clipboard
-    /// bridge): the queued `send` fds have been transmitted, so drop our copies.
+    /// Called by the Wayland loop right after `flush_clients` (see the
+    /// clipboard): the queued `send` fds have been transmitted, so drop our copies.
     pub fn flush_done(&mut self) {
         self.pending_close.clear();
     }

@@ -81,7 +81,7 @@ pub enum InputEvent {
     /// A click landed outside a grabbing popup; dismiss it (`xdg_popup.popup_done`).
     PopupDismiss { window_id: u32 },
     /// The macOS pasteboard changed (or was read for the first time). Carries the
-    /// current plain-text contents, if any. Consumed by the clipboard bridge,
+    /// current plain-text contents, if any. Consumed by the clipboard integration,
     /// which re-advertises it to Wayland clients as a selection. `None` means the
     /// pasteboard holds no text we can offer.
     MacClipboard { text: Option<String> },
