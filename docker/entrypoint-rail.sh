@@ -7,6 +7,41 @@
 # NSWindow. Weston does the compositing here; only pixels + window metadata cross
 # the boundary (contrast with the waypipe image, which forwards the Wayland
 # protocol itself).
+
+# audio_preflight <pulse_server>
+# Fail loud, not silent: two things make audio vanish without any error from the
+# app itself. (1) A stale image built before audio support was added has no
+# libpulse — Firefox/Qt dlopen it at runtime, so they just play muted. (2) The
+# Mac-side daemon isn't up (or unreachable), so the connection is refused. Warn
+# on both so the cause is obvious instead of "no sound, no idea why". Always
+# returns 0 — audio is optional and degrades cleanly. Defined above the
+# sourced-guard below so scripts/test-audio-preflight.sh can exercise it without
+# booting Weston.
+audio_preflight() {
+    local pulse_server="$1"
+    if ! ldconfig -p 2>/dev/null | grep -q 'libpulse\.so'; then
+        echo "[rail-container] WARNING: libpulse not found in this image — apps will play MUTED."
+        echo "[rail-container]   This image predates audio support; rebuild it:"
+        echo "[rail-container]   docker compose --profile rail build wayland-rail && docker compose --profile rail up -d --force-recreate wayland-rail"
+    fi
+    # Reachability probe against the configured PULSE_SERVER (tcp:HOST:PORT).
+    local pa_addr="${pulse_server#tcp:}"
+    local pa_host="${pa_addr%:*}"
+    local pa_port="${pa_addr##*:}"
+    if [ -n "$pa_host" ] && [ -n "$pa_port" ]; then
+        if timeout 2 bash -c "echo > /dev/tcp/${pa_host}/${pa_port}" 2>/dev/null; then
+            echo "[rail-container] audio bridge reachable at ${pa_host}:${pa_port}"
+        else
+            echo "[rail-container] WARNING: audio bridge ${pa_host}:${pa_port} is UNREACHABLE — apps will play MUTED."
+            echo "[rail-container]   Start it on the Mac:  cargo run --features rail   (or: scripts/pulseaudio-mac.sh)"
+        fi
+    fi
+}
+
+# When this file is sourced (by the test harness) rather than executed, stop
+# here: we only want the functions above, not the server bring-up below.
+(return 0 2>/dev/null) && return 0
+
 set -euo pipefail
 
 PORT="${RDP_PORT:-3389}"
@@ -24,6 +59,7 @@ WL_SOCK="wayland-rail"
 # D-Bus-activated helpers inherit it; if the Mac has no daemon, apps start muted.
 export PULSE_SERVER="${PULSE_SERVER:-tcp:${MAC_HOST:-host.docker.internal}:4713}"
 echo "[rail-container] audio -> ${PULSE_SERVER}"
+audio_preflight "$PULSE_SERVER"
 
 CERT_DIR="/etc/weston-rail"
 CERT="${CERT_DIR}/rdp.crt"
