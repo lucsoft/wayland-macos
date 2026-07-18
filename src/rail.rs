@@ -141,21 +141,11 @@ mod imp {
     // the Mac's backing scale). `decorated: true` gives each app a native macOS
     // titlebar.
 
-    extern "C" fn on_window_create(
-        _user: *mut c_void,
-        id: u32,
-        x: i32,
-        y: i32,
-        w: u32,
-        h: u32,
-        title: *const c_char,
-    ) {
-        // RAIL emits 0x0 utility/system windows (owned popups, shell helpers)
-        // that never get content; skip them so we don't spawn stray NSWindows.
-        if w == 0 || h == 0 {
-            return;
-        }
-        let name = cstr(title);
+    /// Spawn the NSWindow for a RAIL toplevel with a valid (non-zero) size.
+    /// Shared by `on_window_create` and the promotion path in `on_window_update`
+    /// (a window the server first announced 0x0 and only later gave a real size —
+    /// see the note there).
+    fn spawn_window(id: u32, x: i32, y: i32, w: u32, h: u32, name: &str) {
         // weston reports geometry in physical pixels at the advertised scale;
         // convert to logical points for the (scale-agnostic) AppKit side.
         let s = rail_scale();
@@ -171,7 +161,7 @@ mod imp {
         // build, so key the host by the window id (one tile per window) and name
         // it from the title (fallback to the RemoteApp program). A no-op when the
         // router is disabled, so this is safe to call unconditionally.
-        let display = if name.is_empty() { "weston-terminal" } else { &name };
+        let display = if name.is_empty() { "weston-terminal" } else { name };
         mac::assign_window(id, id, display, true);
         mac::post(WinCmd::Create {
             id,
@@ -183,13 +173,33 @@ mod imp {
             // e.g. weston-terminal's titlebar), so the NSWindow must be
             // borderless. Adding a native titlebar here double-decorates.
             decorated: false,
-            title: cstr(title),
+            title: name.to_string(),
             geom: (0, 0, 0, 0),
         });
         // Place at weston's chosen position so the mirror is aligned from the
         // start (no jump on the first move, and weston's edges map to the
         // screen's — see WinCmd::Move). Position is physical → logical.
         mac::post(WinCmd::Move { id, x: x / s, y: y / s });
+    }
+
+    extern "C" fn on_window_create(
+        _user: *mut c_void,
+        id: u32,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        title: *const c_char,
+    ) {
+        // The server can announce a real toplevel 0x0 first (GTK/Firefox commit
+        // their first buffer later), then give it a real size via a WindowUpdate.
+        // Defer such a window; it's promoted to a create in `on_window_update`
+        // once it has a size. (A window that stays 0x0 never becomes an NSWindow.)
+        if w == 0 || h == 0 {
+            debug!(target: "rail", "defer 0x0 window id={id} (awaiting first real size)");
+            return;
+        }
+        spawn_window(id, x, y, w, h, &cstr(title));
     }
 
     extern "C" fn on_window_update(
@@ -200,6 +210,21 @@ mod imp {
         w: u32,
         h: u32,
     ) {
+        // A window we deferred at create time (announced 0x0) now has a real size:
+        // this is its true creation, not an update. Without this, a window
+        // launched from within a live session (e.g. Firefox opened from the
+        // terminal) never gets an NSWindow — it only appeared after a session
+        // restart, when the server resyncs it as a create already carrying a size.
+        // The Rust router (rail_route.rs) has already classified it as a mirrored
+        // window, so its surfaces route correctly once it exists.
+        let known = LIVE_WINDOWS.lock().unwrap().contains(&id);
+        if !known {
+            if w > 0 && h > 0 {
+                debug!(target: "rail", "promoting id={id} to a window (first real size {w}x{h})");
+                spawn_window(id, x, y, w, h, "");
+            }
+            return;
+        }
         // weston does a server-side interactive move: it owns the window position
         // and streams new offsets here (physical pixels). Mirror them onto the
         // NSWindow so it follows the drag, converting to logical points; and keep
