@@ -897,6 +897,7 @@ impl State {
     /// Tear down a popup and its native window (see `reap_toplevel`).
     fn reap_popup(&mut self, popup_id: &ObjectId) {
         if let Some(p) = self.popups.remove(popup_id) {
+            debug!(target: "wl", "popup reaped (destroyed by client) -> window {}", p.window_id);
             self.surface_popup.remove(&p.wl_surface.id());
             self.window_surface.remove(&p.window_id);
             // Always send Destroy — even if the popup never mapped a window. A
