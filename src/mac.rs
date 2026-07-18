@@ -600,6 +600,14 @@ define_class!(
         // bars intentionally).
         #[unsafe(method(constrainFrameRect:toScreen:))]
         fn constrain_frame_rect(&self, frame: CGRect, screen: Option<&NSScreen>) -> CGRect {
+            // RAIL: weston is the sole authority on window position — it does
+            // server-side moves, drags, and hides a popup by moving it far
+            // OFF-SCREEN. AppKit's default constraint keeps a window's title bar
+            // on-screen, which would clamp such a hidden popup back into view so it
+            // never disappears. Bypass constraining entirely in RAIL mode.
+            if RAIL_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                return frame;
+            }
             // Fullscreen windows (they cover bars) and layer windows/bars
             // themselves (they own the reserved zone and sit at the screen edge)
             // are positioned exactly by us — bypass AppKit's constraint entirely.
