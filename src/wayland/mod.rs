@@ -622,6 +622,8 @@ impl State {
                     stride: pb.stride,
                     hotspot_x: hx,
                     hotspot_y: hy,
+                    // Wayland cursor buffers are rendered at the output scale.
+                    scale: crate::input::scale(),
                     pixels: pb.bytes,
                 });
             }
@@ -733,6 +735,8 @@ impl State {
                         stride: pb.stride,
                         hotspot_x: hx,
                         hotspot_y: hy,
+                        // Wayland cursor buffers are rendered at the output scale.
+                        scale: crate::input::scale(),
                         pixels: pb.bytes,
                     });
                 }

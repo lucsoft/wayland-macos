@@ -307,9 +307,10 @@ mod imp {
     /// The server changed the cursor to a bitmap (RDP pointer update). Turn it
     /// into the shared `SetCursorImage` path, which builds an NSCursor and applies
     /// it via the views' cursor rects (cursor state is global on the mac side, so
-    /// this isn't per-window). Like RAIL surfaces, the bitmap is scale-1 pixels
-    /// and its hotspot is in those pixels; `make_cursor` scales by the Mac backing
-    /// factor, matching how window content is treated (see on_window_create).
+    /// this isn't per-window). RDP pointer bitmaps arrive at device resolution
+    /// regardless of the desktop scale, so the buffer (and its hotspot) is scale-1;
+    /// `make_cursor` therefore keeps it at 1:1 point size (rather than halving it
+    /// on a Retina display, which made the cursor tiny).
     extern "C" fn on_cursor(
         _user: *mut c_void,
         w: u32,
@@ -330,6 +331,8 @@ mod imp {
             stride: stride as i32,
             hotspot_x: hotspot_x as i32,
             hotspot_y: hotspot_y as i32,
+            // RDP pointer bitmaps are at device resolution (scale 1).
+            scale: 1,
             pixels,
         });
     }

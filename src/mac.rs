@@ -893,9 +893,13 @@ pub enum WinCmd {
         width: i32,
         height: i32,
         stride: i32,
-        /// Hotspot in surface-local (logical) coordinates.
+        /// Hotspot in the cursor buffer's own coordinate space (see `scale`).
         hotspot_x: i32,
         hotspot_y: i32,
+        /// Scale factor of the cursor buffer: how many buffer pixels map to one
+        /// logical point. Wayland cursors are rendered at the output backing
+        /// factor; RAIL (RDP) pointer bitmaps arrive at device resolution (1).
+        scale: i32,
         pixels: Vec<u8>,
     },
     /// Hide the cursor (wl_pointer.set_cursor with a null surface).
@@ -1162,11 +1166,17 @@ fn make_cursor(
     stride: i32,
     hotspot_x: i32,
     hotspot_y: i32,
+    scale: i32,
     pixels: &[u8],
 ) -> Option<Retained<NSCursor>> {
     // Cursor buffers are always ordinary 8-bit BGRA (SDR).
     let image = make_cgimage(width, height, stride, pixels, PixelFormat::Bgra8888, None)?;
-    let scale = crate::input::scale() as f64;
+    // The buffer is `scale` pixels per logical point, so the NSImage's point size
+    // is the pixel size divided by it. Macs upscale the image to physical pixels,
+    // so a device-resolution (scale-1) cursor keeps its apparent size on a Retina
+    // display instead of rendering half-size. The hotspot is already in logical
+    // points (Wayland's surface-local space; RAIL is scale-1 so equal either way).
+    let scale = (scale.max(1)) as f64;
     let size = CGSize::new(width as f64 / scale, height as f64 / scale);
     let ns_image = NSImage::initWithCGImage_size(mtm.alloc::<NSImage>(), &image, size);
     let hotspot = CGPoint::new(hotspot_x as f64, hotspot_y as f64);
@@ -1180,7 +1190,7 @@ fn make_cursor(
 /// A fully transparent 1x1 cursor, used to hide the pointer.
 fn empty_cursor(mtm: MainThreadMarker) -> Retained<NSCursor> {
     let pixels = [0u8; 4]; // transparent BGRA
-    make_cursor(mtm, 1, 1, 4, 0, 0, &pixels).unwrap_or_else(NSCursor::arrowCursor)
+    make_cursor(mtm, 1, 1, 4, 0, 0, 1, &pixels).unwrap_or_else(NSCursor::arrowCursor)
 }
 
 fn grabbed() -> Option<u32> {
@@ -1381,10 +1391,11 @@ fn handle(cmd: WinCmd) {
             stride,
             hotspot_x,
             hotspot_y,
+            scale,
             pixels,
         } => {
             if let Some(cursor) =
-                make_cursor(mtm, width, height, stride, hotspot_x, hotspot_y, &pixels)
+                make_cursor(mtm, width, height, stride, hotspot_x, hotspot_y, scale, &pixels)
             {
                 CURSOR.with(|c| *c.borrow_mut() = Some(cursor));
                 refresh_cursor_rects();
