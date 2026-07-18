@@ -6,6 +6,9 @@
 /bin/waypipe-macos
 /.waypipe-build/
 
+# audio-follow agent: built from scripts/audio-follow-default.swift by scripts/pulseaudio-mac.sh
+/bin/audio-follow-default
+
 # Logs
 *.log
 

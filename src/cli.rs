@@ -526,6 +526,17 @@ fn stop_shared_audio() {
         info!(target: "cli", "killed pulseaudio");
     }
     let _ = fs::remove_file("/tmp/wlmac-pulseaudio.pid");
+
+    // The audio-follow agent (tracks the macOS default output; started by
+    // scripts/pulseaudio-mac.sh) is tied to the bridge — reap it alongside.
+    if let Ok(pid) = fs::read_to_string("/tmp/wlmac-audio-follow.pid") {
+        if let Ok(pid) = pid.trim().parse::<i32>() {
+            if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+                info!(target: "cli", "killed audio-follow agent");
+            }
+        }
+    }
+    let _ = fs::remove_file("/tmp/wlmac-audio-follow.pid");
 }
 
 /// The ports of every instance with a live compositor, discovered from the

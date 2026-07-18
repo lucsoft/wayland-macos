@@ -196,6 +196,19 @@ degrades cleanly: no `pulseaudio` on the Mac (`brew install pulseaudio`) →
 breaks. This is not a native macOS integration (those live on the Wayland socket)
 — it bypasses waypipe entirely.
 
+`module-coreaudio-detect` exposes **every** CoreAudio device as its own Pulse
+sink and pins one static default — which need not be your selected output and
+never follows when you switch it, unlike native Mac apps (which track CoreAudio's
+default-output-device abstraction that Pulse sidesteps). So `pulseaudio-mac.sh`
+also starts a small **audio-follow agent** (`scripts/audio-follow-default.swift`,
+compiled once to `bin/audio-follow-default`): it points the bridge's default sink
+at the macOS default output and moves live streams over, then repeats on every
+change via a CoreAudio property listener. Match key is the device *name*
+(`kAudioObjectPropertyName`), which `module-coreaudio` copies into the sink's
+`Description` — Pulse exposes no UID. Optional (needs `pactl` + the Swift
+toolchain; degrades cleanly), and reaped by `wayland-macos stop` alongside the
+daemon.
+
 The **RAIL back-end reuses this same channel** — RDP/RAIL carries no audio to a
 usable macOS sink (the Mac-side FreeRDP is built `-DWITH_PULSE=OFF
 -DWITH_ALSA=OFF`), so `docker/entrypoint-rail.sh` exports the same `PULSE_SERVER`
