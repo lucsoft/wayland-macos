@@ -38,7 +38,9 @@
  * belong to, or 0 to drop them. */
 extern void rail_route_reset(void);
 extern int rail_route_window_order(uint32_t id, int has_style, uint32_t exstyle,
-                                   uint32_t owner);
+                                   uint32_t owner, int32_t x, int32_t y,
+                                   int32_t w, int32_t h);
+extern uint32_t rail_route_pop_demoted(void);
 extern int rail_route_window_deleted(uint32_t id);
 extern void rail_route_map_surface(uint16_t surface_id, uint32_t window_id);
 extern void rail_route_unmap_window(uint32_t window_id);
@@ -191,9 +193,12 @@ static int route_window_order(rail_window *w, const WINDOW_ORDER_INFO *oi,
     uint32_t owner =
         (oi->fieldFlags & WINDOW_ORDER_FIELD_OWNER) ? ws->ownerWindowId : 0;
     bridge_log(RAIL_LOG_DEBUG,
-               "window order id=%u %ux%u style=0x%08x exstyle=0x%08x owner=%u",
-               w->id, ws->windowWidth, ws->windowHeight, style, exstyle, owner);
-    int verdict = rail_route_window_order(w->id, has_style, exstyle, owner);
+               "window order id=%u %dx%d@(%d,%d) style=0x%08x exstyle=0x%08x owner=%u",
+               w->id, ws->windowWidth, ws->windowHeight, ws->windowOffsetX,
+               ws->windowOffsetY, style, exstyle, owner);
+    int verdict = rail_route_window_order(w->id, has_style, exstyle, owner,
+                                          ws->windowOffsetX, ws->windowOffsetY,
+                                          ws->windowWidth, ws->windowHeight);
     switch (verdict) {
     case 1: /* new mirrored window */
         emit_window_create(w, oi, ws);
@@ -208,6 +213,12 @@ static int route_window_order(rail_window *w, const WINDOW_ORDER_INFO *oi,
         break;
     default: /* 0: known mirrored window — caller handles the plain update */
         break;
+    }
+    /* This order may have revealed an already-mirrored owner as a frame (its
+     * covering content child just arrived). Destroy each such phantom NSWindow. */
+    for (uint32_t dead; (dead = rail_route_pop_demoted()) != 0;) {
+        bridge_log(RAIL_LOG_INFO, "demoting frame window id=%u (covered by child)", dead);
+        g_cb.window_delete(g_cb.user, dead);
     }
     return verdict;
 }
