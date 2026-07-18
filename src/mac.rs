@@ -1630,11 +1630,19 @@ fn handle(cmd: WinCmd) {
                     false
                 }
             });
-            WINDOWS.with(|w| {
+            let closed = WINDOWS.with(|w| {
                 if let Some(e) = w.borrow_mut().remove(&id) {
+                    if let Some(parent) = e.window.parentWindow() {
+                        parent.removeChildWindow(&e.window);
+                    }
+                    e.window.orderOut(None);
                     e.window.close();
+                    true
+                } else {
+                    false
                 }
             });
+            debug!(target: "mac", "Destroy window {id}: closed={closed}");
             LAYER_WINDOWS.with(|f| {
                 f.borrow_mut().remove(&id);
             });
