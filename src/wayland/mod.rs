@@ -1380,6 +1380,34 @@ impl State {
                     }
                 }
                 self.focus_window = if focused { Some(window_id) } else { None };
+                // Signal window (de)activation via xdg_toplevel state — this is
+                // separate from keyboard focus, and clients drive activation-
+                // dependent UI from it: without ever being told it's Activated, a
+                // GTK app renders as inactive and its focus-driven behaviors misfire
+                // (e.g. Firefox's app menu not closing on an outside click). Was only
+                // ever sent on resize before.
+                let tl = self
+                    .toplevels
+                    .values()
+                    .find(|t| t.window_id == window_id)
+                    .map(|t| (t.toplevel.clone(), t.xdg_surface.clone(), t.maximized, t.fullscreen));
+                if let Some((toplevel, xdg_surface, maximized, fullscreen)) = tl {
+                    let mut states = Vec::new();
+                    if focused {
+                        states.extend_from_slice(&(xdg_toplevel::State::Activated as u32).to_ne_bytes());
+                    }
+                    if maximized {
+                        states.extend_from_slice(&(xdg_toplevel::State::Maximized as u32).to_ne_bytes());
+                    }
+                    if fullscreen {
+                        states.extend_from_slice(&(xdg_toplevel::State::Fullscreen as u32).to_ne_bytes());
+                    }
+                    let cfg_serial = self.serial();
+                    // 0x0 lets the client keep its current size — this is an
+                    // activation-only configure, not a resize.
+                    toplevel.configure(0, 0, states);
+                    xdg_surface.configure(cfg_serial);
+                }
                 // Now that the client is focused (and its toolkit is up), it's
                 // safe to advertise the macOS clipboard selection to it.
                 if focused {
