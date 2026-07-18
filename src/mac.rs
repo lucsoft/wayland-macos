@@ -478,12 +478,38 @@ impl WaylandView {
     fn handle_button(&self, ev: &NSEvent, pressed: bool) {
         let button = btn_code(ev.buttonNumber());
         if !pressed {
+            // How far the pointer travelled since the press: a click barely moves, a
+            // drag crosses into the menu.
+            let dragged = IMPLICIT_GRAB_ORIGIN.with(|o| o.get()).is_some_and(|p| {
+                let m = NSEvent::mouseLocation();
+                ((m.x - p.x).powi(2) + (m.y - p.y).powi(2)).sqrt() > 6.0
+            });
+            IMPLICIT_GRAB_ORIGIN.with(|o| o.set(None));
+            // Press-drag-release onto a menu item: the button was pressed on the
+            // parent (a menu button) and released, after dragging, inside the
+            // grabbing popup. Route the release to the popup so the item activates —
+            // the implicit grab would send it to the parent instead. Only when the
+            // pointer actually dragged: a release that didn't move is the opening
+            // click, which must NOT select the item the popup mapped under (a
+            // combobox/menu opening at the cursor).
+            if dragged {
+                if let Some(gid) = grabbed() {
+                    if let Some((x, y, true)) = global_in_window(gid) {
+                        debug!(target: "mac", "button release drag-selected popup {gid}");
+                        push(InputEvent::PointerMotion { window_id: gid, x, y });
+                        push(InputEvent::PointerButton { window_id: gid, button, pressed: false });
+                        IMPLICIT_GRAB.with(|g| g.set(None));
+                        return;
+                    }
+                }
+            }
             // A release belongs to the surface that received the press (the implicit
             // pointer grab): AppKit delivers mouseUp to the pressing view even if a
             // popup mapped on top in between. Routing it here — instead of to the
             // popup grab — stops the click that OPENED a menu from also selecting
             // the item the popup happens to map under.
             if let Some(w) = IMPLICIT_GRAB.with(|g| g.take()) {
+                debug!(target: "mac", "button release -> implicit-grab window {w} (dragged={dragged})");
                 push(InputEvent::PointerButton {
                     window_id: w,
                     button,
@@ -492,6 +518,7 @@ impl WaylandView {
             }
             return;
         }
+        IMPLICIT_GRAB_ORIGIN.with(|o| o.set(Some(NSEvent::mouseLocation())));
         if let Some(gid) = grabbed() {
             if let Some((x, y, inside)) = global_in_window(gid) {
                 debug!(
@@ -1048,6 +1075,11 @@ thread_local! {
     // Its matching release is delivered here regardless of any popup grab, so the
     // click that OPENS a menu doesn't also select the item the popup maps under.
     static IMPLICIT_GRAB: Cell<Option<u32>> = const { Cell::new(None) };
+    // Screen location where the held button was pressed, so a release can tell a
+    // click (opened a menu — honor the implicit grab) from a drag (press-drag-
+    // release onto a menu item — route the release to the grabbing popup so the
+    // item activates).
+    static IMPLICIT_GRAB_ORIGIN: Cell<Option<CGPoint>> = const { Cell::new(None) };
     // The cursor the focused client last requested (via wp_cursor_shape); applied
     // through the view's cursor rects.
     static CURSOR: RefCell<Option<Retained<NSCursor>>> = const { RefCell::new(None) };
