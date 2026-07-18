@@ -1935,20 +1935,31 @@ fn create_popup(
     let lh = (height / scale).max(1) as f64;
 
     // Screen origins from the parent (macOS frames are bottom-left origin): the
-    // requested placement and its per-axis flipped alternative.
-    let (mut origin, flip_origin, parent_screen) = WINDOWS
+    // requested placement and its per-axis flipped alternative. The positioner
+    // coordinates are relative to the parent *surface* — i.e. the content view —
+    // so anchor to the content rect, not the whole window frame. For a decorated
+    // (titled) window the content view sits below the native titlebar; using the
+    // frame would push every popup up by the titlebar height.
+    let (mut origin, flip_origin, parent_screen, dbg) = WINDOWS
         .with(|w| {
             w.borrow().get(&parent_id).map(|p| {
-                let f = p.window.frame();
+                let frame = p.window.frame();
+                let f = p.window.contentRectForFrameRect(frame);
                 let top = f.origin.y + f.size.height;
                 (
                     CGPoint::new(f.origin.x + x as f64, top - y as f64 - lh),
                     CGPoint::new(f.origin.x + x_flip as f64, top - y_flip as f64 - lh),
                     p.window.screen(),
+                    (frame, f, p.decorated),
                 )
             })
         })
-        .unwrap_or((CGPoint::new(200.0, 200.0), CGPoint::new(200.0, 200.0), None));
+        .unwrap_or((
+            CGPoint::new(200.0, 200.0),
+            CGPoint::new(200.0, 200.0),
+            None,
+            (CGRect::default(), CGRect::default(), false),
+        ));
 
     // Constraint adjustment: a client's xdg_positioner asks the compositor to
     // flip/slide a menu that would fall off a screen edge. We prefer the flipped
@@ -2052,10 +2063,14 @@ fn create_popup(
             focused: true,
         });
     }
+    let (pframe, pcontent, pdecorated) = dbg;
     info!(
         target: "mac",
-        "created popup {id} under {parent_id}: requested ({x},{y}) constraint={constraint:#b} \
-         -> screen origin ({:.0},{:.0}) {width}x{height}",
+        "created popup {id} under {parent_id}: requested pt=({x},{y}) flip=({x_flip},{y_flip}) \
+         constraint={constraint:#b} scale={scale} logical={lw:.0}x{lh:.0} | parent decorated={pdecorated} \
+         frame=({:.0},{:.0} {:.0}x{:.0}) content=({:.0},{:.0} {:.0}x{:.0}) -> popup screen origin=({:.0},{:.0})",
+        pframe.origin.x, pframe.origin.y, pframe.size.width, pframe.size.height,
+        pcontent.origin.x, pcontent.origin.y, pcontent.size.width, pcontent.size.height,
         origin.x, origin.y,
     );
 }
