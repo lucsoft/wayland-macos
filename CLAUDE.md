@@ -145,6 +145,11 @@ Buffers that aren't plain shm (e.g. single-pixel) extend the `BufferKind` enum i
 # macOS side: builds + starts pulseaudio, the compositor, waypipe client, and TCP bridge.
 cargo run                      # the wayland-macos orchestrator CLI
 cargo run -- stop              # tear it down
+# Several isolated stacks side by side — each keyed on its bridge --port (the
+# instance id); every socket, log and pidfile is namespaced by it (src/cli.rs
+# `Instance`). Point a container at one with `BRIDGE_PORT=<port> docker compose …`.
+cargo run -- --port 7778       # a second stack (container dials host.docker.internal:7778)
+cargo run -- stop --port 7778  # tear down just that one (--all tears down every instance)
 # Compositor alone (no waypipe/bridge, e.g. for the test client):
 cargo run --bin wayland-macos-core
 
