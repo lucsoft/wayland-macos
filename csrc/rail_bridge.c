@@ -34,6 +34,11 @@ typedef struct {
     int32_t x, y;
     uint32_t w, h;
     int used;
+    /* Set when the window was classified as an auxiliary (shadow/tooltip/tool)
+     * window and deliberately not mirrored to an NSWindow. Kept so later
+     * geometry-only orders for the same id stay suppressed instead of
+     * fail-opening into a phantom window (see rail_is_decoration). */
+    int filtered;
 } rail_window;
 
 /* surfaceId -> windowId association (see rail_map_window_for_surface). */
@@ -187,13 +192,59 @@ static void apply_state(rail_window *w, const WINDOW_ORDER_INFO *oi,
     }
 }
 
+/* Decide whether a RAIL window order describes a real application window (gets
+ * its own NSWindow) or an auxiliary one we must NOT mirror. WSLg's weston
+ * rdprail-shell emits, alongside the app's content window, helper windows for the
+ * CSD drop-shadow / frame — mirroring those spawns a phantom "shadow window" next
+ * to the real one (the classic RAIL double-window). Win32 style bits mark them:
+ * WS_EX_TOOLWINDOW is the canonical "not a primary app window" flag, and an owned
+ * (ownerWindowId != 0) window that is also WS_EX_NOACTIVATE is a non-focusable
+ * helper (shadow/tooltip). Owned but activatable windows (real dialogs) are kept.
+ * Style/owner are only meaningful when their field flags are present; when absent
+ * we fail open (treat as a real window) so a geometry-only order is never lost. */
+static int rail_is_decoration(const WINDOW_ORDER_INFO *oi,
+                              const WINDOW_STATE_ORDER *ws) {
+    if (!(oi->fieldFlags & WINDOW_ORDER_FIELD_STYLE))
+        return 0;
+    uint32_t ex = ws->extendedStyle;
+    uint32_t owner =
+        (oi->fieldFlags & WINDOW_ORDER_FIELD_OWNER) ? ws->ownerWindowId : 0;
+    if (ex & WS_EX_TOOLWINDOW)
+        return 1;
+    if (owner != 0 && (ex & WS_EX_NOACTIVATE))
+        return 1;
+    return 0;
+}
+
 static BOOL rail_window_create(rdpContext *context, const WINDOW_ORDER_INFO *oi,
                                const WINDOW_STATE_ORDER *ws) {
     railContext *rc = (railContext *)context;
+    /* Log the classifying attributes for every order so the filter below is
+     * verifiable/tunable from a single `RUST_LOG=rail=debug` run. */
+    uint32_t style = (oi->fieldFlags & WINDOW_ORDER_FIELD_STYLE) ? ws->style : 0;
+    uint32_t exstyle =
+        (oi->fieldFlags & WINDOW_ORDER_FIELD_STYLE) ? ws->extendedStyle : 0;
+    uint32_t owner =
+        (oi->fieldFlags & WINDOW_ORDER_FIELD_OWNER) ? ws->ownerWindowId : 0;
+    bridge_log(RAIL_LOG_DEBUG,
+               "window order id=%u %ux%u style=0x%08x exstyle=0x%08x owner=%u",
+               oi->windowId, ws->windowWidth, ws->windowHeight, style, exstyle,
+               owner);
     rail_window *w = win_alloc(rc, oi->windowId);
     if (!w)
         return TRUE;
     apply_state(w, oi, ws);
+    /* Auxiliary (shadow/tooltip/tool) window: keep the slot so later orders for
+     * this id stay suppressed, but don't mirror it or let it become the content
+     * fallback window. This is what kills the RAIL double ("shadow") window. */
+    if (rail_is_decoration(oi, ws)) {
+        w->filtered = 1;
+        bridge_log(RAIL_LOG_INFO,
+                   "skipping non-app window id=%u (exstyle=0x%08x owner=%u)",
+                   oi->windowId, exstyle, owner);
+        return TRUE;
+    }
+    w->filtered = 0;
     if (w->w > 0 && w->h > 0)
         g_main_window_id = oi->windowId;
 
@@ -214,6 +265,18 @@ static BOOL rail_window_update(rdpContext *context, const WINDOW_ORDER_INFO *oi,
         return rail_window_create(context, oi, ws);
     apply_state(w, oi, ws);
 
+    /* A previously filtered helper window. Stay suppressed for geometry/title
+     * updates; only a STYLE order that clears the decoration bits promotes it to
+     * a real window (routed back through the create path so it appears). */
+    if (w->filtered) {
+        if ((oi->fieldFlags & WINDOW_ORDER_FIELD_STYLE) &&
+            !rail_is_decoration(oi, ws)) {
+            w->used = 0; /* let create re-allocate + notify cleanly */
+            return rail_window_create(context, oi, ws);
+        }
+        return TRUE;
+    }
+
     if (oi->fieldFlags & WINDOW_ORDER_FIELD_TITLE) {
         char *title = ws->titleInfo.length ? rail_title_utf8(&ws->titleInfo) : NULL;
         g_cb.window_title(g_cb.user, w->id, title ? title : "");
@@ -229,13 +292,17 @@ static BOOL rail_window_delete(rdpContext *context,
                                const WINDOW_ORDER_INFO *oi) {
     railContext *rc = (railContext *)context;
     rail_window *w = win_find(rc, oi->windowId);
+    /* A filtered helper window has no NSWindow; free its slot but don't emit a
+     * delete for an id the Rust side never created. */
+    int was_filtered = w && w->filtered;
     if (w)
         w->used = 0;
     /* Drop any surface mappings for this window (defensive: the server should
      * also send UnmapWindowForSurface, but a stale mapping would misroute a
      * recycled surfaceId to a destroyed window). */
     surf_map_clear_window(rc, oi->windowId);
-    g_cb.window_delete(g_cb.user, oi->windowId);
+    if (!was_filtered)
+        g_cb.window_delete(g_cb.user, oi->windowId);
     return TRUE;
 }
 
