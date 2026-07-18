@@ -296,13 +296,9 @@ define_class!(
             }
             let (x, y) = self.local(ev);
             let id = self.ivars().window_id.get();
+            // Pointer enter only — keyboard focus is click-to-focus (see
+            // windowDidBecomeKey), it does NOT follow the pointer.
             push(InputEvent::PointerEnter { window_id: id, x, y });
-            // Pointer events still flow (item hover), but keyboard focus stays on an
-            // open menu — focus-follows-mouse must not steal it (a non-grabbing menu
-            // closes when it loses keyboard focus).
-            if !popup_open() {
-                push(InputEvent::Focus { window_id: id, focused: true });
-            }
         }
         #[unsafe(method(mouseExited:))]
         fn mouse_exited(&self, _ev: &NSEvent) {
@@ -311,11 +307,6 @@ define_class!(
             }
             let id = self.ivars().window_id.get();
             push(InputEvent::PointerLeave { window_id: id });
-            // See mouseEntered: don't send a keyboard-leave while a menu is open, or
-            // moving the pointer off a non-grabbing menu would dismiss it.
-            if !popup_open() {
-                push(InputEvent::Focus { window_id: id, focused: false });
-            }
         }
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, ev: &NSEvent) {
@@ -743,6 +734,21 @@ define_class!(
         // the client it lost focus. Without this, a client that dismisses menus on
         // focus-out (e.g. Firefox's in-content app menu) keeps them open forever,
         // because mouseExited only fires if the pointer physically leaves the view.
+        // Click-to-focus (the macOS convention): keyboard focus follows the key
+        // window, set when the user clicks a window or the app activates — NOT the
+        // pointer. (Focus-following-the-pointer churned wl_keyboard.enter/leave on
+        // every hover, which unsettled clients — e.g. Firefox menus.)
+        #[unsafe(method(windowDidBecomeKey:))]
+        fn window_did_become_key(&self, _notif: &NSNotification) {
+            // An open menu holds keyboard focus until dismissed; don't steal it.
+            if popup_open() {
+                return;
+            }
+            push(InputEvent::Focus {
+                window_id: self.ivars().window_id,
+                focused: true,
+            });
+        }
         #[unsafe(method(windowDidResignKey:))]
         fn window_did_resign_key(&self, _notif: &NSNotification) {
             // The app lost key focus (clicked another app / our other window / the
