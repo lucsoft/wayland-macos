@@ -434,42 +434,39 @@ mod imp {
         let (wake_r, wake_w) = waker_pipe();
         bus.set_waker(wake_w);
 
-        // Render scale: weston-mirror scales globally (not per-monitor), so use
-        // the PRIMARY monitor's backing factor. A HiDPI-aware app then renders
-        // crisp on a Retina primary; windows on a standard monitor render at the
-        // same scale (correct size, softness varies). The desktop is advertised
-        // in PHYSICAL pixels at that scale so weston's 2x geometry fits.
+        // Render scale: present RAIL content 1:1 (buffer pixels → logical points).
+        // This weston build passes each app's buffer through at the size the app
+        // itself draws — a non-HiDPI app (weston-terminal) stays 1x regardless of
+        // the advertised DesktopScaleFactor, verified live: its buffer is the same
+        // size whether we advertise scale 1 or 2. So dividing by the Mac's backing
+        // factor just halves every such window (the "small window" bug). Advertise
+        // the display's LOGICAL size at scale 1 so weston sizes its desktop to our
+        // points and windows come back at their natural size. (True crisp HiDPI
+        // would need weston to render clients at 2x, which it doesn't do here; a 1x
+        // buffer is upscaled by macOS — correct size, slightly soft on Retina.)
         let mac_scale = crate::input::scale().max(1);
         let (phys_w, phys_h) = crate::input::output_size();
-        let logical_w = (phys_w / mac_scale).max(1);
-        let logical_h = (phys_h / mac_scale).max(1);
+        let out_w = (phys_w / mac_scale).max(1);
+        let out_h = (phys_h / mac_scale).max(1);
+        let scale = 1u32;
         let mons = crate::input::monitors();
-        let s = mons
-            .iter()
-            .find(|m| m.primary)
-            .map(|m| m.scale)
-            .unwrap_or(mac_scale)
-            .max(1);
-        RAIL_SCALE.store(s, std::sync::atomic::Ordering::Relaxed);
-        let out_w = logical_w * s;
-        let out_h = logical_h * s;
-        let scale = s as u32;
+        RAIL_SCALE.store(1, std::sync::atomic::Ordering::Relaxed);
 
-        // Monitor layout, in the physical (×s) desktop space to match. weston
-        // ignores the per-monitor scale (global only) but uses the geometry to lay
-        // the displays out, which keeps cross-monitor dragging aligned.
+        // Monitor layout in logical points (matching the 1:1 desktop above). weston
+        // uses the geometry to arrange the displays — which keeps cross-monitor
+        // dragging aligned — and applies one global scale, not per-monitor DPI.
         let monitors: Vec<RailMonitor> = mons
             .iter()
             .map(|m| RailMonitor {
-                x: m.x * s,
-                y: m.y * s,
-                width: (m.width.max(1) * s) as u32,
-                height: (m.height.max(1) * s) as u32,
-                scale: s as u32,
+                x: m.x,
+                y: m.y,
+                width: m.width.max(1) as u32,
+                height: m.height.max(1) as u32,
+                scale: 1,
                 is_primary: m.primary as i32,
             })
             .collect();
-        info!(target: "rail", "advertising {} monitor(s), desktop {out_w}x{out_h} scale={s}", monitors.len());
+        info!(target: "rail", "advertising {} monitor(s), desktop {out_w}x{out_h} scale=1 (1:1)", monitors.len());
 
         // FreeRDP event loop on its own thread (blocking).
         let host_c = CString::new(host).expect("host");
