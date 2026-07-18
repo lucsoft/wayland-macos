@@ -1370,6 +1370,7 @@ impl State {
                 let Some(surface) = self.window_surface.get(&window_id).cloned() else {
                     return;
                 };
+                debug!(target: "wl", "keyboard focus -> window {window_id} focused={focused}");
                 let serial = self.serial();
                 for k in keyboards_for(&self.keyboards, &surface) {
                     if focused {
