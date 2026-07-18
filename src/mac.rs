@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dispatch2::{DispatchQueue, DispatchTime};
-use log::{error, info};
+use log::{debug, error, info};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -494,6 +494,10 @@ impl WaylandView {
         }
         if let Some(gid) = grabbed() {
             if let Some((x, y, inside)) = global_in_window(gid) {
+                debug!(
+                    target: "mac",
+                    "button press with popup grab on {gid}: cursor {}", if inside { "inside -> route to popup" } else { "outside -> dismiss" }
+                );
                 if inside {
                     // Ensure the popup has the pointer at the click location.
                     push(InputEvent::PointerMotion {
@@ -514,6 +518,10 @@ impl WaylandView {
             }
             return;
         }
+        debug!(
+            target: "mac",
+            "button press on window {} (no popup grab active)", self.ivars().window_id.get()
+        );
         self.button(ev, true);
         IMPLICIT_GRAB.with(|g| g.set(Some(self.ivars().window_id.get())));
     }
