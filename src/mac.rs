@@ -379,11 +379,17 @@ impl WaylandView {
 
     fn motion(&self, ev: &NSEvent) {
         let (x, y) = self.local(ev);
-        push(InputEvent::PointerMotion {
-            window_id: self.ivars().window_id.get(),
-            x,
-            y,
+        let id = self.ivars().window_id.get();
+        // Log only when motion switches to a different window (low noise): shows
+        // whether the toolbar (parent) keeps receiving motion vs. it jumping to a
+        // tooltip/popup window.
+        LAST_MOTION_WIN.with(|c| {
+            if c.get() != Some(id) {
+                c.set(Some(id));
+                debug!(target: "mac", "motion now on window {id}");
+            }
         });
+        push(InputEvent::PointerMotion { window_id: id, x, y });
     }
 
     /// If a move is pending for this window, hand off to the native window drag
@@ -1093,6 +1099,8 @@ thread_local! {
     // release onto a menu item — route the release to the grabbing popup so the
     // item activates).
     static IMPLICIT_GRAB_ORIGIN: Cell<Option<CGPoint>> = const { Cell::new(None) };
+    // Last window motion was routed to (debug: detect motion switching windows).
+    static LAST_MOTION_WIN: Cell<Option<u32>> = const { Cell::new(None) };
     // The cursor the focused client last requested (via wp_cursor_shape); applied
     // through the view's cursor rects.
     static CURSOR: RefCell<Option<Retained<NSCursor>>> = const { RefCell::new(None) };
