@@ -310,6 +310,10 @@ enum BufferKind {
 #[derive(Default)]
 struct SurfaceRec {
     pending_buffer: Option<WlBuffer>,
+    /// Whether `wl_surface.attach` was called this commit cycle. Distinguishes an
+    /// explicit `attach(NULL)` (unmap — `pending_buffer` None *and* this true) from
+    /// a plain redraw commit with no attach (`pending_buffer` None, this false).
+    pending_attach: bool,
     frame_callbacks: Vec<WlCallback>,
     window_id: Option<u32>,
     /// `xdg_surface.set_window_geometry` origin within the buffer — i.e. the CSD
@@ -694,10 +698,11 @@ impl State {
     fn handle_commit(&mut self, surface: &WlSurface) {
         let sid = surface.id();
         let tl_id = self.surface_toplevel.get(&sid).cloned();
-        let pending = self
+        let (pending, did_attach) = self
             .surfaces
             .get_mut(&sid)
-            .and_then(|r| r.pending_buffer.take());
+            .map(|r| (r.pending_buffer.take(), std::mem::take(&mut r.pending_attach)))
+            .unwrap_or((None, false));
 
         // Apply any staged color description (double-buffered, like the buffer).
         if let Some(rec) = self.surfaces.get_mut(&sid) {
@@ -811,6 +816,13 @@ impl State {
                 self.present(&sid, &buffer);
             }
             buffer.release();
+        } else if did_attach {
+            // An explicit `attach(NULL)` commit unmaps the surface. GTK hides a
+            // popup/menu this way (keeping the xdg_popup object) rather than
+            // destroying it, so without this the popup's NSWindow — and any grab —
+            // would linger on screen forever (Firefox menus/tab-preview never
+            // closing). Tear down the native window; a later buffer re-creates it.
+            self.unmap_surface(&sid);
         }
         // Frame callbacks and presentation feedback are deferred to the periodic
         // vblank tick (see vblank_tick) so the client is paced to a steady ~60Hz
@@ -861,6 +873,25 @@ impl State {
             popup.popup.popup_done();
         }
         mac::post(WinCmd::SetGrab { window: None });
+    }
+
+    /// Handle an `attach(NULL)` unmap: hide the native window for a surface whose
+    /// client hid it without destroying the shell object. Scoped to popups — the
+    /// case GTK/Firefox exercises when it hides a menu or tab-preview by unmapping.
+    /// The window id stays reserved and `created_window` resets, so a later buffer
+    /// re-creates the popup (a menu the client re-shows). `Destroy` also clears the
+    /// pointer grab and restores focus, so the menu both closes and frees input.
+    fn unmap_surface(&mut self, sid: &ObjectId) {
+        if let Some(pp_id) = self.surface_popup.get(sid).cloned() {
+            if let Some(p) = self.popups.get_mut(&pp_id) {
+                if p.created_window {
+                    p.created_window = false;
+                    let window_id = p.window_id;
+                    debug!(target: "wl", "popup unmap (attach null) -> window {window_id}");
+                    mac::post(WinCmd::Destroy { id: window_id });
+                }
+            }
+        }
     }
 
     /// Tear down a popup and its native window (see `reap_toplevel`).
@@ -2733,6 +2764,66 @@ mod harness_tests {
             h.client().cstate.popup_done_count,
             1,
             "dismiss stays idempotent"
+        );
+    }
+
+    /// GTK hides a popup by committing a null buffer (unmap) while keeping the
+    /// xdg_popup object. That must tear down the native window (and its grab), or
+    /// a Firefox menu / tab-preview would linger on screen forever.
+    #[test]
+    fn popup_unmap_via_null_attach_destroys_window() {
+        let mut h = Harness::new();
+        let (_surface, xdg, _tl) = h.make_toplevel();
+        let seat = h.client().seat.clone();
+        let (psurf, _popup, popup_window) = h.make_popup(&xdg, &seat);
+
+        // Map the popup: attach a buffer and commit -> native window is created.
+        let buf = h.shm_buffer(4096, None, 0, 16, 16);
+        psurf.attach(Some(&buf), 0, 0);
+        psurf.commit();
+        h.pump();
+        assert!(
+            h.cmds()
+                .iter()
+                .any(|c| matches!(c, WinCmd::CreatePopup { id, .. } if *id == popup_window)),
+            "popup maps to a native window"
+        );
+
+        // Hide it by unmapping (attach null) -> the native window is destroyed.
+        psurf.attach(None, 0, 0);
+        psurf.commit();
+        h.pump();
+        assert!(
+            h.cmds()
+                .iter()
+                .any(|c| matches!(c, WinCmd::Destroy { id } if *id == popup_window)),
+            "attach(null) commit unmaps the popup's native window"
+        );
+    }
+
+    /// A bufferless commit that did NOT attach (a plain redraw/handshake commit)
+    /// must not be mistaken for an unmap.
+    #[test]
+    fn bufferless_commit_without_attach_is_not_an_unmap() {
+        let mut h = Harness::new();
+        let (_surface, xdg, _tl) = h.make_toplevel();
+        let seat = h.client().seat.clone();
+        let (psurf, _popup, popup_window) = h.make_popup(&xdg, &seat);
+
+        let buf = h.shm_buffer(4096, None, 0, 16, 16);
+        psurf.attach(Some(&buf), 0, 0);
+        psurf.commit();
+        h.pump();
+        let _ = h.cmds();
+
+        // Commit again with no attach at all: keeps the current buffer, no unmap.
+        psurf.commit();
+        h.pump();
+        assert!(
+            !h.cmds()
+                .iter()
+                .any(|c| matches!(c, WinCmd::Destroy { id } if *id == popup_window)),
+            "a redraw commit with no attach must not destroy the popup"
         );
     }
 

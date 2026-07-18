@@ -64,6 +64,9 @@ impl Dispatch<WlSurface, ()> for State {
             wl_surface::Request::Attach { buffer, .. } => {
                 if let Some(rec) = state.surfaces.get_mut(&surface.id()) {
                     rec.pending_buffer = buffer;
+                    // Record the attach so a committed `attach(NULL)` reads as an
+                    // unmap, not a bufferless redraw (see handle_commit).
+                    rec.pending_attach = true;
                 }
             }
             wl_surface::Request::Frame { callback } => {
