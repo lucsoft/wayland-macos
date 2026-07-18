@@ -309,13 +309,21 @@ module / TCP listener).
   a release goes to the surface that received the *press*, not the popup grab.
   Without it, the click that opens a menu also selects whatever item the popup maps
   under (newly visible since popups map in ~2ms after the nodelay fix).
-  A grabbing menu is also dismissed when the whole app is **deactivated** — the
-  user clicks another macOS app or the desktop, so no view of ours receives the
-  click and the click-outside path can't fire. `windowDidResignKey` dismisses the
-  grabbed popup, and the parent's focus-out (`Focus{false}`) dismisses whatever
-  popup holds focus instead of being dropped as a stale leave (`dismiss_popup` is
-  idempotent via `PopupRec.dismissed`, so the two paths firing for one click send
-  a single `popup_done`). Fixes Firefox context menus lingering after clicking away.
+  A menu is also dismissed when the whole app is **deactivated** — the user clicks
+  another macOS app or the desktop, so no view of ours receives the click and the
+  click-outside path can't fire. `windowDidResignKey` emits a **distinct**
+  `AppDeactivated` event and the engine dismisses whatever popup holds focus
+  (`dismiss_popup` is idempotent via `PopupRec.dismissed`). It must be distinct
+  from a plain `Focus{false}`: a pointer leave *also* arrives as `Focus{false}`,
+  and a popup opening under the cursor makes the toplevel's view report
+  `mouseExited` — so keying the dismiss off `Focus{false}` killed a non-grabbing
+  context menu the instant it appeared (the "flash and vanish" bug). Relatedly, a
+  non-grabbing menu holds keyboard focus until dismissed: pointer movement must not
+  hand focus away (that's what `click-to-focus` below guarantees), or GTK treats
+  the keyboard-leave as "close". And GTK **hides a popup by unmapping** it
+  (`wl_surface.attach(NULL)` + commit) rather than destroying the `xdg_popup`;
+  `handle_commit` treats a committed null attach as an unmap and tears the popup
+  window down (`unmap_surface`), else a Firefox menu / tab-preview lingers forever.
   Popups honor the `xdg_positioner` **constraint adjustment** to stay on-screen.
   `set_constraint_adjustment` is read into `PositionerState`; the engine resolves
   both the requested origin and a per-axis **flipped** candidate (anchor + gravity
@@ -328,8 +336,20 @@ module / TCP listener).
   hit-test still works. (`resize` adjustment isn't implemented; a popup larger than
   the work area pins to the min edge.) Note: many app menus are
   NOT Wayland popups — e.g. Firefox's hamburger "AppMenu" is drawn in-content in the
-  toplevel's own buffer, so it has no `xdg_popup`/grab and closes via a click the
-  client receives, or on focus-out (`windowDidResignKey` → `Focus{false}`).
+  toplevel's own buffer, so it has no `xdg_popup`/grab. Such an in-content panel
+  closes on an outside click **only if the toplevel is marked activated** (see
+  Focus & activation) — without the `xdg_toplevel` Activated state the app renders
+  inactive and its rollup misfires, so the menu wouldn't close.
+- Focus & activation: keyboard focus is **click-to-focus** (the macOS convention),
+  not focus-follows-mouse. `windowDidBecomeKey` grants focus (`Focus{true}`),
+  `windowDidResignKey` drops it (`Focus{false}` + `AppDeactivated`); `mouseEntered`/
+  `mouseExited` carry only `wl_pointer` enter/leave, never keyboard focus. (Pointer
+  routing keys off `pointer_focus`, so KWin still gets its events.) An open menu
+  keeps focus regardless of the pointer (`POPUP_WINDOWS` gates `windowDidBecomeKey`;
+  focus is handed back to the window under the cursor when the last menu closes).
+  Separately, focus-in/out sends an `xdg_toplevel` **Activated** state change (an
+  activation-only `0x0` configure) — distinct from `wl_keyboard` focus, and the
+  signal GTK/Firefox use for active/inactive rendering and focus-driven UI.
 - Transport: the `socat` TCP bridges (the `wayland-macos` CLI, `docker/entrypoint.sh`)
   set `nodelay` (TCP_NODELAY). The Wayland wire is chatty request/reply; without it
   Nagle stalls small replies by hundreds of ms.

@@ -1104,10 +1104,10 @@ thread_local! {
     // constrainFrameRect: must leave them alone — otherwise a bar is pushed out of
     // its own exclusive zone.
     static LAYER_WINDOWS: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
-    // Currently-mapped popup windows (menus). While any is open, focus-follows-
-    // mouse is suppressed: a menu holds keyboard focus until dismissed, so moving
-    // the pointer off it must not send a keyboard-leave (which a non-grabbing menu,
-    // e.g. a Firefox context menu, treats as "close").
+    // Currently-mapped popup windows (menus). While any is open, a window becoming
+    // key must NOT steal keyboard focus from the menu (which holds it until
+    // dismissed); `windowDidBecomeKey` checks `popup_open()`. When the last menu
+    // closes, focus is handed back to the window under the cursor.
     static POPUP_WINDOWS: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
 }
 
@@ -2131,12 +2131,17 @@ fn create_popup(
     let (pframe, pcontent, pdecorated) = dbg;
     info!(
         target: "mac",
-        "created popup {id} under {parent_id}: requested pt=({x},{y}) flip=({x_flip},{y_flip}) \
-         constraint={constraint:#b} scale={scale} logical={lw:.0}x{lh:.0} | parent decorated={pdecorated} \
-         frame=({:.0},{:.0} {:.0}x{:.0}) content=({:.0},{:.0} {:.0}x{:.0}) -> popup screen origin=({:.0},{:.0})",
+        "created popup {id} under {parent_id} at ({:.0},{:.0}) {lw:.0}x{lh:.0}",
+        origin.x, origin.y,
+    );
+    // Full placement inputs, for diagnosing a mis-positioned menu.
+    debug!(
+        target: "mac",
+        "popup {id} placement: requested pt=({x},{y}) flip=({x_flip},{y_flip}) \
+         constraint={constraint:#b} scale={scale} | parent decorated={pdecorated} \
+         frame=({:.0},{:.0} {:.0}x{:.0}) content=({:.0},{:.0} {:.0}x{:.0})",
         pframe.origin.x, pframe.origin.y, pframe.size.width, pframe.size.height,
         pcontent.origin.x, pcontent.origin.y, pcontent.size.width, pcontent.size.height,
-        origin.x, origin.y,
     );
 }
 
