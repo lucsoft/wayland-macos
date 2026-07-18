@@ -30,6 +30,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -79,13 +80,15 @@ fn print_help() {
     println!(
         "wayland-macos — Wayland-on-macOS orchestrator\n\n\
          USAGE:\n\
-         \x20 wayland-macos [up] [--multiplex]\n\
+         \x20 wayland-macos [up] [-d] [--multiplex]\n\
          \x20 wayland-macos stop\n\n\
          COMMANDS:\n\
          \x20 up     (default) start pulseaudio + the compositor (+ waypipe & TCP bridge for the waypipe back-end)\n\
          \x20 stop   tear down everything `up` started\n\n\
-         FLAGS (forwarded to the compositor):\n\
-         \x20 --multiplex                        surface each app as its own native macOS app\n\n\
+         FLAGS:\n\
+         \x20 -d, --detach                       start everything, then exit (stop it later with `wayland-macos stop`)\n\
+         \x20 --multiplex                        surface each app as its own native macOS app (forwarded to the compositor)\n\n\
+         By default `up` stays in the foreground; press Ctrl-C to tear everything down.\n\n\
          Back-end is a build-time choice: a plain build is the waypipe back-end; a\n\
          `--features rail` build is the RAIL back-end (no waypipe/bridge).\n\n\
          Env: WLMAC_MULTIPLEX=1 implies --multiplex; BRIDGE_PORT overrides the TCP\n\
@@ -99,6 +102,10 @@ fn print_help() {
 // ---------------------------------------------------------------------------
 
 fn up(flags: &[String]) {
+    // `-d`/`--detach`: start everything and exit (the old behavior — children are
+    // detached daemons). Without it we stay in the foreground and tear everything
+    // down on Ctrl-C.
+    let detach = flags.iter().any(|f| f == "-d" || f == "--detach");
     let multiplex = flags.iter().any(|f| f == "--multiplex")
         || std::env::var("WLMAC_MULTIPLEX").as_deref() == Ok("1");
     // The back-end is a build-time choice: a `--features rail` build is the
@@ -118,17 +125,47 @@ fn up(flags: &[String]) {
         // Weston RDP server — there's no local Wayland socket, waypipe, or socat
         // bridge (that's the waypipe pipeline). Start the container separately.
         info!(target: "cli", "RAIL back-end started; now start the container: docker compose --profile rail up wayland-rail");
-        return;
+    } else {
+        // waypipe pipeline: connect a waypipe client to the compositor's socket and
+        // expose it to the container over a TCP<->unix bridge.
+        let (runtime, display) = discover_socket();
+        let waypipe = ensure_waypipe(root.as_deref());
+        start_waypipe_client(&waypipe, &runtime, &display);
+        let port = std::env::var("BRIDGE_PORT").unwrap_or_else(|_| "7777".to_string());
+        start_socat(&port);
+        info!(target: "cli", "ready. Container should connect to host.docker.internal:{port}");
     }
 
-    // waypipe pipeline: connect a waypipe client to the compositor's socket and
-    // expose it to the container over a TCP<->unix bridge.
-    let (runtime, display) = discover_socket();
-    let waypipe = ensure_waypipe(root.as_deref());
-    start_waypipe_client(&waypipe, &runtime, &display);
-    let port = std::env::var("BRIDGE_PORT").unwrap_or_else(|_| "7777".to_string());
-    start_socat(&port);
-    info!(target: "cli", "ready. Container should connect to host.docker.internal:{port}");
+    if detach {
+        info!(target: "cli", "detached; children keep running. Tear down with `wayland-macos stop`.");
+    } else {
+        run_foreground();
+    }
+}
+
+/// Block until SIGINT/SIGTERM, then tear everything back down.
+///
+/// The children are detached daemons (`spawn_detached`), so this CLI doesn't own
+/// them as OS children — it just parks until interrupted and then runs the same
+/// `stop()` the `stop` subcommand does. Keeps the common `cargo run` case a
+/// single foreground process you can Ctrl-C, without changing how children are
+/// launched (so `-d` + `stop` still works identically).
+fn run_foreground() {
+    static STOP: AtomicBool = AtomicBool::new(false);
+    extern "C" fn on_signal(_: libc::c_int) {
+        // Only async-signal-safe work here: flip a flag the main loop polls.
+        STOP.store(true, Ordering::SeqCst);
+    }
+    unsafe {
+        libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+    }
+    info!(target: "cli", "running; press Ctrl-C to stop");
+    while !STOP.load(Ordering::SeqCst) {
+        sleep(Duration::from_millis(200));
+    }
+    info!(target: "cli", "interrupted; shutting down");
+    stop();
 }
 
 /// Start the shared PulseAudio CoreAudio bridge via `scripts/pulseaudio-mac.sh`.
