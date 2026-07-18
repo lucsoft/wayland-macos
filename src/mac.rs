@@ -297,7 +297,12 @@ define_class!(
             let (x, y) = self.local(ev);
             let id = self.ivars().window_id.get();
             push(InputEvent::PointerEnter { window_id: id, x, y });
-            push(InputEvent::Focus { window_id: id, focused: true });
+            // Pointer events still flow (item hover), but keyboard focus stays on an
+            // open menu — focus-follows-mouse must not steal it (a non-grabbing menu
+            // closes when it loses keyboard focus).
+            if !popup_open() {
+                push(InputEvent::Focus { window_id: id, focused: true });
+            }
         }
         #[unsafe(method(mouseExited:))]
         fn mouse_exited(&self, _ev: &NSEvent) {
@@ -306,7 +311,11 @@ define_class!(
             }
             let id = self.ivars().window_id.get();
             push(InputEvent::PointerLeave { window_id: id });
-            push(InputEvent::Focus { window_id: id, focused: false });
+            // See mouseEntered: don't send a keyboard-leave while a menu is open, or
+            // moving the pointer off a non-grabbing menu would dismiss it.
+            if !popup_open() {
+                push(InputEvent::Focus { window_id: id, focused: false });
+            }
         }
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, ev: &NSEvent) {
@@ -1089,6 +1098,17 @@ thread_local! {
     // constrainFrameRect: must leave them alone — otherwise a bar is pushed out of
     // its own exclusive zone.
     static LAYER_WINDOWS: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
+    // Currently-mapped popup windows (menus). While any is open, focus-follows-
+    // mouse is suppressed: a menu holds keyboard focus until dismissed, so moving
+    // the pointer off it must not send a keyboard-leave (which a non-grabbing menu,
+    // e.g. a Firefox context menu, treats as "close").
+    static POPUP_WINDOWS: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
+}
+
+/// True while any popup (menu) is open. Used to keep keyboard focus pinned to the
+/// menu instead of following the pointer.
+fn popup_open() -> bool {
+    POPUP_WINDOWS.with(|p| !p.borrow().is_empty())
 }
 
 /// Fill the window's screen (visible area for maximize, whole screen for
@@ -1616,7 +1636,14 @@ fn handle(cmd: WinCmd) {
             SAVED_FRAMES.with(|s| {
                 s.borrow_mut().remove(&id);
             });
+            // A menu closing re-enables focus-follows-mouse (once no popup remains).
+            let was_popup = POPUP_WINDOWS.with(|p| p.borrow_mut().remove(&id));
             if grab_ended {
+                restore_focus_under_cursor();
+            } else if was_popup && !popup_open() {
+                // A non-grabbing menu closed (no grab to end): hand focus back to
+                // whatever window is now under the cursor, since focus-follows-mouse
+                // was suppressed while it was open.
                 restore_focus_under_cursor();
             }
         }
@@ -2067,6 +2094,10 @@ fn create_popup(
                 sublayers: HashMap::new(),
             },
         );
+    });
+    // A menu is open: pin keyboard focus to it (see POPUP_WINDOWS / mouse_exited).
+    POPUP_WINDOWS.with(|p| {
+        p.borrow_mut().insert(id);
     });
 
     // Menus usually open under the cursor. NSTrackingArea only emits mouseEntered
