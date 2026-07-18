@@ -27,6 +27,7 @@
 #include <freerdp/input.h>
 
 #define MAX_WINDOWS 256
+#define MAX_SURFACES 256
 
 /* Window/surface *routing policy* lives in Rust (src/rail_route.rs) so it can be
  * unit-tested headlessly; this bridge is the transport that feeds it. These are
@@ -52,11 +53,26 @@ typedef struct {
     int used;
 } rail_window;
 
+/* A surface frame that arrived before its MapWindowForSurface. weston-rdprail
+ * consistently sends 1-2 UpdateSurfaceArea PDUs before mapping a surface to its
+ * window, so at that point the router can't route them (the target is ambiguous
+ * while other windows exist). Rather than drop them — which blanks an app that
+ * paints once and idles, e.g. a terminal — we hold the latest here and flush it
+ * when the mapping arrives. Transport-level buffering; the routing decision stays
+ * in the Rust router (rail_route_resolve). Keyed by surfaceId. */
+typedef struct {
+    uint16_t surface_id;
+    int used;
+    uint8_t *pixels;
+    uint32_t w, h, stride;
+} surf_pending;
+
 /* Our rdpContext subclass. The base rdpContext MUST be the first member so
  * FreeRDP can cast between them. */
 typedef struct {
     rdpContext context;
     rail_window windows[MAX_WINDOWS];
+    surf_pending pending[MAX_SURFACES];
 } railContext;
 
 /* Single active session. RAIL is inherently one connection here, and the input
@@ -248,6 +264,76 @@ static BOOL rail_window_delete(rdpContext *context,
 
 /* ---- painting ---------------------------------------------------------- */
 
+/* Find (or, if `alloc`, allocate) this surface's pending-frame slot. */
+static surf_pending *pending_slot(railContext *rc, uint16_t surface_id,
+                                  int alloc) {
+    surf_pending *free_slot = NULL;
+    for (int i = 0; i < MAX_SURFACES; i++) {
+        if (rc->pending[i].used && rc->pending[i].surface_id == surface_id)
+            return &rc->pending[i];
+        if (!free_slot && !rc->pending[i].used)
+            free_slot = &rc->pending[i];
+    }
+    if (alloc && free_slot) {
+        free_slot->used = 1;
+        free_slot->surface_id = surface_id;
+        free_slot->pixels = NULL;
+        return free_slot;
+    }
+    return NULL;
+}
+
+/* Release a surface's pending frame (mapped now, or gone). */
+static void pending_clear(railContext *rc, uint16_t surface_id) {
+    surf_pending *s = pending_slot(rc, surface_id, 0);
+    if (s) {
+        free(s->pixels);
+        s->pixels = NULL;
+        s->used = 0;
+    }
+}
+
+/* Stash the latest pre-map frame for a surface (replacing any previous one). */
+static void pending_set(railContext *rc, uint16_t surface_id,
+                        const gdiGfxSurface *surface) {
+    surf_pending *s = pending_slot(rc, surface_id, 1);
+    if (!s)
+        return;
+    size_t sz = (size_t)surface->scanline * surface->height;
+    uint8_t *buf = (uint8_t *)realloc(s->pixels, sz);
+    if (!buf)
+        return;
+    memcpy(buf, surface->data, sz);
+    s->pixels = buf;
+    s->w = surface->width;
+    s->h = surface->height;
+    s->stride = surface->scanline;
+}
+
+/* Hand a BGRA32 frame to Rust, cropped to the window's logical size. The gfx
+ * surface is the window rounded up to 16-px alignment (e.g. 806x491 -> 816x496),
+ * so the extra rows/cols are padding; crop to the RAIL window's size (top-left)
+ * so the window has no dead margin. */
+static void emit_surface(uint32_t win, const uint8_t *data, uint32_t width,
+                         uint32_t height, uint32_t scanline) {
+    rail_window *rw = win_find(g_ctx, win);
+    if (rw && rw->w > 0 && rw->h > 0 && (uint32_t)rw->w <= width &&
+        (uint32_t)rw->h <= height &&
+        ((uint32_t)rw->w != width || (uint32_t)rw->h != height)) {
+        uint32_t cw = (uint32_t)rw->w, ch = (uint32_t)rw->h, cstride = cw * 4;
+        uint8_t *buf = (uint8_t *)malloc((size_t)cstride * ch);
+        if (buf) {
+            for (uint32_t r = 0; r < ch; r++)
+                memcpy(buf + (size_t)r * cstride, data + (size_t)r * scanline,
+                       cstride);
+            g_cb.window_surface(g_cb.user, win, cw, ch, cstride, buf);
+            free(buf);
+            return;
+        }
+    }
+    g_cb.window_surface(g_cb.user, win, width, height, scanline, data);
+}
+
 /* In HiDef RAIL mode there is no desktop; each window's content is delivered as
  * an rdpgfx surface mapped to that window (MapSurfaceToWindow). FreeRDP's gdi
  * gfx renders those into per-surface buffers and, for window-mapped surfaces,
@@ -264,46 +350,47 @@ static UINT rail_update_surface_area(RdpgfxClientContext *gfx, UINT16 surfaceId,
         return CHANNEL_RC_OK;
     /* Resolve the target mirrored window (Rust router): the WSLg
      * MapWindowForSurface mapping first, then the surface's own windowId, then —
-     * only when a single window exists — that lone window. 0 means "drop": an
-     * ambiguous or auxiliary-window surface, which must NOT be smeared onto some
-     * other window (that was the tooltip-over-content bug). */
+     * only when a single window exists — that lone window. 0 means the router
+     * can't attribute it yet (ambiguous while the map is still pending) or it
+     * maps to an auxiliary window. */
     uint32_t win = rail_route_resolve(surfaceId, (uint32_t)surface->windowId);
-    if (win == 0)
+    if (win == 0) {
+        /* No window yet. Hold the frame; MapWindowForSurface arrives 1-2 PDUs
+         * later and flushes it. Dropping instead blanks an app that paints once
+         * and idles (a terminal never repaints after its first frame). */
+        pending_set(g_ctx, surfaceId, surface);
         return CHANNEL_RC_OK;
-    /* Surfaces are BGRA32 (gdi initialised with PIXEL_FORMAT_BGRA32). The gfx
-     * surface is the window rounded up to 16-px alignment (e.g. 806x491 -> a
-     * 816x496 surface), so the extra rows/cols are padding, not content. Crop to
-     * the RAIL window's logical size (top-left) so the window has no dead margin. */
-    rail_window *rw = win_find(g_ctx, win);
-    if (rw && rw->w > 0 && rw->h > 0 && (uint32_t)rw->w <= surface->width &&
-        (uint32_t)rw->h <= surface->height &&
-        ((uint32_t)rw->w != surface->width || (uint32_t)rw->h != surface->height)) {
-        uint32_t cw = (uint32_t)rw->w, ch = (uint32_t)rw->h, cstride = cw * 4;
-        uint8_t *buf = (uint8_t *)malloc((size_t)cstride * ch);
-        if (buf) {
-            for (uint32_t r = 0; r < ch; r++)
-                memcpy(buf + (size_t)r * cstride,
-                       surface->data + (size_t)r * surface->scanline, cstride);
-            g_cb.window_surface(g_cb.user, win, cw, ch, cstride, buf);
-            free(buf);
-            return CHANNEL_RC_OK;
-        }
     }
-    g_cb.window_surface(g_cb.user, win, surface->width, surface->height,
-                        surface->scanline, surface->data);
+    pending_clear(g_ctx, surfaceId); /* mapped now — no stale pre-map frame */
+    emit_surface(win, surface->data, surface->width, surface->height,
+                 surface->scanline);
     return CHANNEL_RC_OK;
 }
 
 /* WSLg fork callbacks: the server associates an rdpgfx surface with a RAIL
  * window through these (not the standard MapSurfaceToWindow PDU). Record the
- * mapping so rail_update_surface_area routes each surface to the right window.
- * NOTE: the surface is already locked here — do no gfx calls, only bookkeeping. */
+ * mapping so rail_update_surface_area routes each surface to the right window,
+ * then flush any frame that arrived before the mapping (see pending_set) to the
+ * window the router now resolves it to — otherwise an app whose only frame
+ * preceded the map (an idle terminal) would stay blank.
+ * NOTE: the surface is already locked here — do no gfx calls, only bookkeeping
+ * (emit_surface only copies our own buffer and posts to Rust). */
 static UINT rail_map_window_for_surface(RdpgfxClientContext *gfx,
                                         UINT16 surfaceID, UINT64 windowID) {
     (void)gfx;
     bridge_log(RAIL_LOG_INFO, "map surface %u -> window %llu", surfaceID,
                (unsigned long long)windowID);
     rail_route_map_surface(surfaceID, (uint32_t)windowID);
+    surf_pending *s = pending_slot(g_ctx, surfaceID, 0);
+    if (s && s->pixels) {
+        uint32_t win = rail_route_resolve(surfaceID, 0);
+        if (win != 0) {
+            bridge_log(RAIL_LOG_DEBUG, "flush pending sid=%u -> win=%u %ux%u",
+                       surfaceID, win, s->w, s->h);
+            emit_surface(win, s->pixels, s->w, s->h, s->stride);
+        }
+        pending_clear(g_ctx, surfaceID);
+    }
     return CHANNEL_RC_OK;
 }
 
@@ -788,6 +875,9 @@ int rail_run(const char *host, int port, const char *app, uint32_t desktop_w,
 
     freerdp_disconnect(instance);
     g_cb.disconnected(g_cb.user);
+    /* Free any pre-map frames still held for surfaces never mapped at teardown. */
+    for (int i = 0; i < MAX_SURFACES; i++)
+        free(((railContext *)ctx)->pending[i].pixels);
     freerdp_client_context_free(ctx);
     g_ctx = NULL;
     return 0;
