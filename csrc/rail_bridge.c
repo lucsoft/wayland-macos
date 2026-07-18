@@ -27,33 +27,36 @@
 #include <freerdp/input.h>
 
 #define MAX_WINDOWS 256
-#define MAX_SURFACES 256
 
+/* Window/surface *routing policy* lives in Rust (src/rail_route.rs) so it can be
+ * unit-tested headlessly; this bridge is the transport that feeds it. These are
+ * its `#[no_mangle]` entry points. rail_route_window_order returns an Order
+ * discriminant: 1 = new mirrored window (emit create), 0 = known mirrored window
+ * (plain update), -1 = was mirrored, now filtered (destroy), -2 = filtered
+ * (suppress). rail_route_resolve returns the mirrored window a surface's pixels
+ * belong to, or 0 to drop them. */
+extern void rail_route_reset(void);
+extern int rail_route_window_order(uint32_t id, int has_style, uint32_t exstyle,
+                                   uint32_t owner);
+extern int rail_route_window_deleted(uint32_t id);
+extern void rail_route_map_surface(uint16_t surface_id, uint32_t window_id);
+extern void rail_route_unmap_window(uint32_t window_id);
+extern uint32_t rail_route_resolve(uint16_t surface_id, uint32_t surface_window_id);
+
+/* Per-window geometry, tracked only for surface cropping and move mirroring; the
+ * mirror/filter decision and surface routing are the Rust router's job. */
 typedef struct {
     uint32_t id;
     int32_t x, y;
     uint32_t w, h;
     int used;
-    /* Set when the window was classified as an auxiliary (shadow/tooltip/tool)
-     * window and deliberately not mirrored to an NSWindow. Kept so later
-     * geometry-only orders for the same id stay suppressed instead of
-     * fail-opening into a phantom window (see rail_is_decoration). */
-    int filtered;
 } rail_window;
-
-/* surfaceId -> windowId association (see rail_map_window_for_surface). */
-typedef struct {
-    uint16_t surface_id;
-    uint32_t window_id;
-    int used;
-} surf_map;
 
 /* Our rdpContext subclass. The base rdpContext MUST be the first member so
  * FreeRDP can cast between them. */
 typedef struct {
     rdpContext context;
     rail_window windows[MAX_WINDOWS];
-    surf_map surfaces[MAX_SURFACES];
 } railContext;
 
 /* Single active session. RAIL is inherently one connection here, and the input
@@ -77,11 +80,6 @@ static void bridge_log(int level, const char *fmt, ...) {
         fprintf(stderr, "[rail-c] %s\n", buf);
     }
 }
-/* The most recent real (non-0x0) RAIL window. WSLg delivers window content as
- * rdpgfx surfaces that (in this build) arrive without a MapSurfaceToWindow, so
- * we associate unmapped content surfaces with this window. */
-static uint32_t g_main_window_id = 0;
-
 /* ---- window slot bookkeeping ------------------------------------------- */
 
 static rail_window *win_find(railContext *rc, uint32_t id) {
@@ -104,46 +102,6 @@ static rail_window *win_alloc(railContext *rc, uint32_t id) {
         }
     }
     return NULL;
-}
-
-/* ---- surface -> window mapping ----------------------------------------- */
-//
-// WSLg's weston-rdprail backend doesn't send the standard MS-RDPEGFX
-// MapSurfaceToWindow PDU (so FreeRDP's gdi never sets surface->windowId).
-// Instead it uses the WSLg fork's MapWindowForSurface / UnmapWindowForSurface
-// callbacks to associate each rdpgfx surface with a RAIL window. We record that
-// mapping here so multi-window sessions route each surface's content to the
-// correct NSWindow (previously every surface fell back to the last-created
-// window via g_main_window_id, so only one app ever rendered).
-
-static void surf_map_set(railContext *rc, uint16_t surface_id, uint32_t window_id) {
-    surf_map *free_slot = NULL;
-    for (int i = 0; i < MAX_SURFACES; i++) {
-        if (rc->surfaces[i].used && rc->surfaces[i].surface_id == surface_id) {
-            rc->surfaces[i].window_id = window_id;
-            return;
-        }
-        if (!free_slot && !rc->surfaces[i].used)
-            free_slot = &rc->surfaces[i];
-    }
-    if (free_slot) {
-        free_slot->used = 1;
-        free_slot->surface_id = surface_id;
-        free_slot->window_id = window_id;
-    }
-}
-
-static uint32_t surf_map_lookup(railContext *rc, uint16_t surface_id) {
-    for (int i = 0; i < MAX_SURFACES; i++)
-        if (rc->surfaces[i].used && rc->surfaces[i].surface_id == surface_id)
-            return rc->surfaces[i].window_id;
-    return 0;
-}
-
-static void surf_map_clear_window(railContext *rc, uint32_t window_id) {
-    for (int i = 0; i < MAX_SURFACES; i++)
-        if (rc->surfaces[i].used && rc->surfaces[i].window_id == window_id)
-            rc->surfaces[i].used = 0;
 }
 
 /* Convert a RAIL_UNICODE_STRING (UTF-16LE bytes) to a freshly-malloc'd UTF-8
@@ -192,68 +150,60 @@ static void apply_state(rail_window *w, const WINDOW_ORDER_INFO *oi,
     }
 }
 
-/* Decide whether a RAIL window order describes a real application window (gets
- * its own NSWindow) or an auxiliary one we must NOT mirror. WSLg's weston
- * rdprail-shell emits, alongside the app's content window, helper windows for the
- * CSD drop-shadow / frame — mirroring those spawns a phantom "shadow window" next
- * to the real one (the classic RAIL double-window). Win32 style bits mark them:
- * WS_EX_TOOLWINDOW is the canonical "not a primary app window" flag, and an owned
- * (ownerWindowId != 0) window that is also WS_EX_NOACTIVATE is a non-focusable
- * helper (shadow/tooltip). Owned but activatable windows (real dialogs) are kept.
- * Style/owner are only meaningful when their field flags are present; when absent
- * we fail open (treat as a real window) so a geometry-only order is never lost. */
-static int rail_is_decoration(const WINDOW_ORDER_INFO *oi,
-                              const WINDOW_STATE_ORDER *ws) {
-    if (!(oi->fieldFlags & WINDOW_ORDER_FIELD_STYLE))
-        return 0;
-    uint32_t ex = ws->extendedStyle;
-    uint32_t owner =
-        (oi->fieldFlags & WINDOW_ORDER_FIELD_OWNER) ? ws->ownerWindowId : 0;
-    if (ex & WS_EX_TOOLWINDOW)
-        return 1;
-    if (owner != 0 && (ex & WS_EX_NOACTIVATE))
-        return 1;
-    return 0;
-}
-
-static BOOL rail_window_create(rdpContext *context, const WINDOW_ORDER_INFO *oi,
+/* Emit a window_create for `w` (pulls the UTF-8 title out of the order). */
+static void emit_window_create(rail_window *w, const WINDOW_ORDER_INFO *oi,
                                const WINDOW_STATE_ORDER *ws) {
-    railContext *rc = (railContext *)context;
-    /* Log the classifying attributes for every order so the filter below is
-     * verifiable/tunable from a single `RUST_LOG=rail=debug` run. */
-    uint32_t style = (oi->fieldFlags & WINDOW_ORDER_FIELD_STYLE) ? ws->style : 0;
-    uint32_t exstyle =
-        (oi->fieldFlags & WINDOW_ORDER_FIELD_STYLE) ? ws->extendedStyle : 0;
-    uint32_t owner =
-        (oi->fieldFlags & WINDOW_ORDER_FIELD_OWNER) ? ws->ownerWindowId : 0;
-    bridge_log(RAIL_LOG_DEBUG,
-               "window order id=%u %ux%u style=0x%08x exstyle=0x%08x owner=%u",
-               oi->windowId, ws->windowWidth, ws->windowHeight, style, exstyle,
-               owner);
-    rail_window *w = win_alloc(rc, oi->windowId);
-    if (!w)
-        return TRUE;
-    apply_state(w, oi, ws);
-    /* Auxiliary (shadow/tooltip/tool) window: keep the slot so later orders for
-     * this id stay suppressed, but don't mirror it or let it become the content
-     * fallback window. This is what kills the RAIL double ("shadow") window. */
-    if (rail_is_decoration(oi, ws)) {
-        w->filtered = 1;
-        bridge_log(RAIL_LOG_INFO,
-                   "skipping non-app window id=%u (exstyle=0x%08x owner=%u)",
-                   oi->windowId, exstyle, owner);
-        return TRUE;
-    }
-    w->filtered = 0;
-    if (w->w > 0 && w->h > 0)
-        g_main_window_id = oi->windowId;
-
     char *title = NULL;
     if ((oi->fieldFlags & WINDOW_ORDER_FIELD_TITLE) && ws->titleInfo.length)
         title = rail_title_utf8(&ws->titleInfo);
     g_cb.window_create(g_cb.user, w->id, w->x, w->y, w->w, w->h,
                        title ? title : "");
     free(title);
+}
+
+/* Feed a window order to the Rust router and act on its verdict. `oi`/`ws` carry
+ * the Win32 style bits (present iff WINDOW_ORDER_FIELD_STYLE); the router uses
+ * them to classify the window as a real app window or an auxiliary (shadow /
+ * tooltip / sub-surface) one and returns what the bridge should do. Shared by the
+ * WindowCreate and WindowUpdate order callbacks so both funnel through one
+ * decision. Returns the router verdict (>=0 mirrored, <0 filtered). */
+static int route_window_order(rail_window *w, const WINDOW_ORDER_INFO *oi,
+                              const WINDOW_STATE_ORDER *ws) {
+    int has_style = (oi->fieldFlags & WINDOW_ORDER_FIELD_STYLE) ? 1 : 0;
+    uint32_t style = has_style ? ws->style : 0;
+    uint32_t exstyle = has_style ? ws->extendedStyle : 0;
+    uint32_t owner =
+        (oi->fieldFlags & WINDOW_ORDER_FIELD_OWNER) ? ws->ownerWindowId : 0;
+    bridge_log(RAIL_LOG_DEBUG,
+               "window order id=%u %ux%u style=0x%08x exstyle=0x%08x owner=%u",
+               w->id, ws->windowWidth, ws->windowHeight, style, exstyle, owner);
+    int verdict = rail_route_window_order(w->id, has_style, exstyle, owner);
+    switch (verdict) {
+    case 1: /* new mirrored window */
+        emit_window_create(w, oi, ws);
+        break;
+    case -1: /* was mirrored, now reclassified as auxiliary -> destroy it */
+        g_cb.window_delete(g_cb.user, w->id);
+        /* fallthrough to log */
+    case -2: /* auxiliary window, suppressed */
+        bridge_log(RAIL_LOG_INFO,
+                   "skipping non-app window id=%u (exstyle=0x%08x owner=%u)",
+                   w->id, exstyle, owner);
+        break;
+    default: /* 0: known mirrored window — caller handles the plain update */
+        break;
+    }
+    return verdict;
+}
+
+static BOOL rail_window_create(rdpContext *context, const WINDOW_ORDER_INFO *oi,
+                               const WINDOW_STATE_ORDER *ws) {
+    railContext *rc = (railContext *)context;
+    rail_window *w = win_alloc(rc, oi->windowId);
+    if (!w)
+        return TRUE;
+    apply_state(w, oi, ws);
+    route_window_order(w, oi, ws);
     return TRUE;
 }
 
@@ -265,17 +215,11 @@ static BOOL rail_window_update(rdpContext *context, const WINDOW_ORDER_INFO *oi,
         return rail_window_create(context, oi, ws);
     apply_state(w, oi, ws);
 
-    /* A previously filtered helper window. Stay suppressed for geometry/title
-     * updates; only a STYLE order that clears the decoration bits promotes it to
-     * a real window (routed back through the create path so it appears). */
-    if (w->filtered) {
-        if ((oi->fieldFlags & WINDOW_ORDER_FIELD_STYLE) &&
-            !rail_is_decoration(oi, ws)) {
-            w->used = 0; /* let create re-allocate + notify cleanly */
-            return rail_window_create(context, oi, ws);
-        }
+    /* Reclassify through the router. Anything but a known mirrored window (0) is
+     * fully handled there — a create for a promotion, a delete for a demotion, or
+     * a suppressed auxiliary window — so only the plain-update case falls through. */
+    if (route_window_order(w, oi, ws) != 0)
         return TRUE;
-    }
 
     if (oi->fieldFlags & WINDOW_ORDER_FIELD_TITLE) {
         char *title = ws->titleInfo.length ? rail_title_utf8(&ws->titleInfo) : NULL;
@@ -292,16 +236,12 @@ static BOOL rail_window_delete(rdpContext *context,
                                const WINDOW_ORDER_INFO *oi) {
     railContext *rc = (railContext *)context;
     rail_window *w = win_find(rc, oi->windowId);
-    /* A filtered helper window has no NSWindow; free its slot but don't emit a
-     * delete for an id the Rust side never created. */
-    int was_filtered = w && w->filtered;
     if (w)
         w->used = 0;
-    /* Drop any surface mappings for this window (defensive: the server should
-     * also send UnmapWindowForSurface, but a stale mapping would misroute a
-     * recycled surfaceId to a destroyed window). */
-    surf_map_clear_window(rc, oi->windowId);
-    if (!was_filtered)
+    /* The router drops the window's surface mappings and tells us whether it had
+     * been mirrored — so we only emit a delete for an NSWindow that was created.
+     * A filtered (auxiliary) window has none, so it self-heals to no-op. */
+    if (rail_route_window_deleted(oi->windowId))
         g_cb.window_delete(g_cb.user, oi->windowId);
     return TRUE;
 }
@@ -322,13 +262,12 @@ static UINT rail_update_surface_area(RdpgfxClientContext *gfx, UINT16 surfaceId,
     gdiGfxSurface *surface = (gdiGfxSurface *)gfx->GetSurfaceData(gfx, surfaceId);
     if (!surface || !surface->data)
         return CHANNEL_RC_OK;
-    /* Resolve the target window: the WSLg MapWindowForSurface mapping first,
-     * then the surface's own windowId (standard MapSurfaceToWindow), and only
-     * as a last resort the most-recent window (single-window fallback). */
-    uint32_t win = g_ctx ? surf_map_lookup(g_ctx, surfaceId) : 0;
-    if (win == 0)
-        win = surface->windowId != 0 ? (uint32_t)surface->windowId
-                                     : g_main_window_id;
+    /* Resolve the target mirrored window (Rust router): the WSLg
+     * MapWindowForSurface mapping first, then the surface's own windowId, then —
+     * only when a single window exists — that lone window. 0 means "drop": an
+     * ambiguous or auxiliary-window surface, which must NOT be smeared onto some
+     * other window (that was the tooltip-over-content bug). */
+    uint32_t win = rail_route_resolve(surfaceId, (uint32_t)surface->windowId);
     if (win == 0)
         return CHANNEL_RC_OK;
     /* Surfaces are BGRA32 (gdi initialised with PIXEL_FORMAT_BGRA32). The gfx
@@ -364,16 +303,14 @@ static UINT rail_map_window_for_surface(RdpgfxClientContext *gfx,
     (void)gfx;
     bridge_log(RAIL_LOG_INFO, "map surface %u -> window %llu", surfaceID,
                (unsigned long long)windowID);
-    if (g_ctx)
-        surf_map_set(g_ctx, surfaceID, (uint32_t)windowID);
+    rail_route_map_surface(surfaceID, (uint32_t)windowID);
     return CHANNEL_RC_OK;
 }
 
 static UINT rail_unmap_window_for_surface(RdpgfxClientContext *gfx,
                                           UINT64 windowID) {
     (void)gfx;
-    if (g_ctx)
-        surf_map_clear_window(g_ctx, (uint32_t)windowID);
+    rail_route_unmap_window((uint32_t)windowID);
     return CHANNEL_RC_OK;
 }
 
@@ -690,7 +627,7 @@ int rail_run(const char *host, int port, const char *app, uint32_t desktop_w,
     setvbuf(stderr, NULL, _IONBF, 0); /* unbuffered so diagnostics flush live */
     g_rail_started = 0;
     g_rail = NULL;
-    g_main_window_id = 0;
+    rail_route_reset();
     g_cb = *cb;
 
     RDP_CLIENT_ENTRY_POINTS ep;

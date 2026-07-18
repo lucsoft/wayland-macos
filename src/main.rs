@@ -11,6 +11,7 @@ mod input;
 mod ipc;
 mod mac;
 mod rail;
+mod rail_route;
 mod router;
 mod wayland;
 
