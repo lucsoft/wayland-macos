@@ -376,39 +376,88 @@ struct PositionerState {
     anchor: u32,
     /// `xdg_positioner.gravity` direction the popup extends (enum value).
     gravity: u32,
+    /// `xdg_positioner.set_constraint_adjustment` bitmask: how the popup may be
+    /// moved to stay on-screen (slide_x=1, slide_y=2, flip_x=4, flip_y=8,
+    /// resize_x=16, resize_y=32). Resolved against the screen in `create_popup`,
+    /// where the parent's on-screen position is known.
+    constraint_adjustment: u32,
 }
 
 impl PositionerState {
-    /// Popup top-left relative to the parent, resolving anchor + gravity + offset.
-    /// Anchor/gravity enum values (shared by both): 0 none, 1 top, 2 bottom,
-    /// 3 left, 4 right, 5 top_left, 6 bottom_left, 7 top_right, 8 bottom_right.
+    /// Popup top-left on the X axis relative to the parent, resolving the anchor
+    /// edge + gravity + offset. With `flip`, the anchor edge and gravity are both
+    /// inverted (an xdg_positioner `flip_x` adjustment) — so a menu that would run
+    /// off the right edge instead aligns to the anchor's opposite edge and extends
+    /// left. Anchor/gravity enum values: 0 none, 1 top, 2 bottom, 3 left, 4 right,
+    /// 5 top_left, 6 bottom_left, 7 top_right, 8 bottom_right.
+    fn origin_x(&self, flip: bool) -> i32 {
+        let (ax, _, aw, _) = self.anchor_rect;
+        let pw = self.size.0;
+        let (mut left, mut right) = (
+            matches!(self.anchor, 3 | 5 | 6),
+            matches!(self.anchor, 4 | 7 | 8),
+        );
+        let (mut gleft, mut gright) = (
+            matches!(self.gravity, 3 | 5 | 6),
+            matches!(self.gravity, 4 | 7 | 8),
+        );
+        if flip {
+            std::mem::swap(&mut left, &mut right);
+            std::mem::swap(&mut gleft, &mut gright);
+        }
+        let anchor_x = if left {
+            ax
+        } else if right {
+            ax + aw
+        } else {
+            ax + aw / 2
+        };
+        let x = if gright {
+            anchor_x // popup extends right from the anchor
+        } else if gleft {
+            anchor_x - pw // popup extends left
+        } else {
+            anchor_x - pw / 2 // centered
+        };
+        x + self.offset.0
+    }
+
+    /// Popup top-left on the Y axis (see `origin_x`); `flip` inverts along Y.
+    fn origin_y(&self, flip: bool) -> i32 {
+        let (_, ay, _, ah) = self.anchor_rect;
+        let ph = self.size.1;
+        let (mut top, mut bottom) = (
+            matches!(self.anchor, 1 | 5 | 7),
+            matches!(self.anchor, 2 | 6 | 8),
+        );
+        let (mut gtop, mut gbottom) = (
+            matches!(self.gravity, 1 | 5 | 7),
+            matches!(self.gravity, 2 | 6 | 8),
+        );
+        if flip {
+            std::mem::swap(&mut top, &mut bottom);
+            std::mem::swap(&mut gtop, &mut gbottom);
+        }
+        let anchor_y = if top {
+            ay
+        } else if bottom {
+            ay + ah
+        } else {
+            ay + ah / 2
+        };
+        let y = if gbottom {
+            anchor_y // popup extends down from the anchor
+        } else if gtop {
+            anchor_y - ph // popup extends up
+        } else {
+            anchor_y - ph / 2 // centered
+        };
+        y + self.offset.1
+    }
+
+    /// Popup top-left relative to the parent (no constraint adjustment).
     fn popup_origin(&self) -> (i32, i32) {
-        let (ax, ay, aw, ah) = self.anchor_rect;
-        // Anchor point on the anchor rect.
-        let anchor_x = match self.anchor {
-            3 | 5 | 6 => ax,           // left / top_left / bottom_left
-            4 | 7 | 8 => ax + aw,      // right / top_right / bottom_right
-            _ => ax + aw / 2,          // none / top / bottom -> horizontal center
-        };
-        let anchor_y = match self.anchor {
-            1 | 5 | 7 => ay,           // top / top_left / top_right
-            2 | 6 | 8 => ay + ah,      // bottom / bottom_left / bottom_right
-            _ => ay + ah / 2,          // none / left / right -> vertical center
-        };
-        // Gravity: which way the popup extends from the anchor point, i.e. which
-        // corner of the popup sits at the anchor point.
-        let (pw, ph) = self.size;
-        let x = match self.gravity {
-            3 | 5 | 6 => anchor_x - pw, // left: popup is to the left
-            4 | 7 | 8 => anchor_x,      // right: popup is to the right
-            _ => anchor_x - pw / 2,     // none/top/bottom: centered horizontally
-        };
-        let y = match self.gravity {
-            1 | 5 | 7 => anchor_y - ph, // top: popup is above
-            2 | 6 | 8 => anchor_y,      // bottom: popup is below
-            _ => anchor_y - ph / 2,     // none/left/right: centered vertically
-        };
-        (x + self.offset.0, y + self.offset.1)
+        (self.origin_x(false), self.origin_y(false))
     }
 }
 
@@ -420,10 +469,21 @@ struct PopupRec {
     window_id: u32,
     x: i32,
     y: i32,
+    /// The popup top-left with the anchor+gravity flipped on each axis — the
+    /// candidate `create_popup` falls back to when the un-flipped `(x, y)` would
+    /// run off a screen edge and the positioner allows a `flip` adjustment.
+    x_flip: i32,
+    y_flip: i32,
+    /// `xdg_positioner` constraint-adjustment bitmask (flip/slide/resize).
+    constraint: u32,
     w: i32,
     h: i32,
     configured: bool,
     created_window: bool,
+    /// Set once `xdg_popup.popup_done` has been sent, so a second dismiss (e.g. the
+    /// pointer-grab path and the parent's focus-out both firing for one click that
+    /// leaves the app) doesn't emit a redundant `popup_done`.
+    dismissed: bool,
 }
 
 /// A `zwlr_layer_surface_v1`: a docked bar/panel anchored to a screen edge.
@@ -785,6 +845,24 @@ impl State {
         }
     }
 
+    /// Send `xdg_popup.popup_done` for the popup mapped to `window_id` and clear
+    /// the mac-side pointer grab. Idempotent: a menu can be dismissed from more
+    /// than one path for a single click that leaves the app (the pointer-grab
+    /// hit-test and the parent's focus-out), so the `dismissed` flag stops a
+    /// second `popup_done` going out for the same popup.
+    fn dismiss_popup(&mut self, window_id: u32) {
+        if let Some(popup) = self
+            .popups
+            .values_mut()
+            .find(|p| p.window_id == window_id && !p.dismissed)
+        {
+            popup.dismissed = true;
+            debug!(target: "wl", "popup dismiss window {window_id}");
+            popup.popup.popup_done();
+        }
+        mac::post(WinCmd::SetGrab { window: None });
+    }
+
     /// Tear down a popup and its native window (see `reap_toplevel`).
     fn reap_popup(&mut self, popup_id: &ObjectId) {
         if let Some(p) = self.popups.remove(popup_id) {
@@ -885,9 +963,18 @@ impl State {
         if let Some(pp_id) = self.surface_popup.get(sid).cloned() {
             // This popup's own shadow-margin offset within its buffer.
             let popup_geom = self.surfaces.get(sid).map(|s| s.geometry_offset).unwrap_or((0, 0));
-            let (px, py, parent_window, window_id, created) = {
+            let (px, py, px_flip, py_flip, constraint, parent_window, window_id, created) = {
                 let p = &self.popups[&pp_id];
-                (p.x, p.y, p.parent_window, p.window_id, p.created_window)
+                (
+                    p.x,
+                    p.y,
+                    p.x_flip,
+                    p.y_flip,
+                    p.constraint,
+                    p.parent_window,
+                    p.window_id,
+                    p.created_window,
+                )
             };
             // The parent's content offset within its buffer (its shadow margin).
             let parent_geom = self
@@ -898,9 +985,12 @@ impl State {
                 .map(|s| s.geometry_offset)
                 .unwrap_or((0, 0));
             // Popup buffer top-left = parent content origin + configured offset,
-            // minus the popup's own geometry offset.
+            // minus the popup's own geometry offset. The flipped candidate lives in
+            // the same space, so shift it the same way.
             let adj_x = parent_geom.0 + px - popup_geom.0;
             let adj_y = parent_geom.1 + py - popup_geom.1;
+            let adj_x_flip = parent_geom.0 + px_flip - popup_geom.0;
+            let adj_y_flip = parent_geom.1 + py_flip - popup_geom.1;
 
             if !created {
                 mac::post(WinCmd::CreatePopup {
@@ -908,6 +998,9 @@ impl State {
                     parent_id: parent_window,
                     x: adj_x,
                     y: adj_y,
+                    x_flip: adj_x_flip,
+                    y_flip: adj_y_flip,
+                    constraint,
                     width,
                     height,
                 });
@@ -1237,6 +1330,18 @@ impl State {
                     return;
                 }
                 if !focused && self.focus_window != Some(window_id) {
+                    // A focus-out for a window that doesn't currently hold focus
+                    // usually just means a redundant leave — drop it. But if focus
+                    // sits on a popup, this is the app being deactivated (the user
+                    // clicked another macOS app) while a menu is open: the parent
+                    // NSWindow resigns key, but the click never reached any of our
+                    // views, so the pointer-grab dismiss can't fire. Dismiss the
+                    // popup here so Firefox/GTK menus don't linger on screen.
+                    if let Some(fw) = self.focus_window {
+                        if self.popups.values().any(|p| p.window_id == fw) {
+                            self.dismiss_popup(fw);
+                        }
+                    }
                     return;
                 }
                 let Some(surface) = self.window_surface.get(&window_id).cloned() else {
@@ -1326,17 +1431,9 @@ impl State {
                 }
             }
             InputEvent::PopupDismiss { window_id } => {
-                // Click outside a grabbing menu: tell the client to dismiss it.
-                let popup = self
-                    .popups
-                    .values()
-                    .find(|p| p.window_id == window_id)
-                    .map(|p| p.popup.clone());
-                debug!(target: "wl", "popup dismiss window {window_id}");
-                if let Some(popup) = popup {
-                    popup.popup_done();
-                }
-                mac::post(WinCmd::SetGrab { window: None });
+                // Click outside a grabbing menu (or the app was deactivated with a
+                // menu open): tell the client to dismiss it.
+                self.dismiss_popup(window_id);
             }
             // TODO(clipboard): placeholder so the build stays exhaustive; the
             // pasteboard->selection logic lives elsewhere / is WIP.
@@ -1778,6 +1875,28 @@ mod tests {
         assert_eq!(p.popup_origin(), (55, -43), "offset shifts the origin");
     }
 
+    /// A `flip` inverts both the anchor edge and the gravity, so a menu anchored
+    /// to a button's bottom-left and extending right instead aligns to the
+    /// button's right edge and extends left — keeping it under the button rather
+    /// than mirrored around a single point.
+    #[test]
+    fn positioner_flip_inverts_anchor_and_gravity() {
+        // A 40-wide button at x=100; a 200-wide menu. anchor bottom-left (6),
+        // gravity bottom-right (8): the menu's left edge sits at the button's left
+        // (x=100) and runs right to 300.
+        let p = PositionerState {
+            size: (200, 150),
+            anchor_rect: (100, 0, 40, 30),
+            anchor: 6,
+            gravity: 8,
+            ..Default::default()
+        };
+        assert_eq!(p.origin_x(false), 100, "un-flipped: left-aligned, extends right");
+        // Flipped: anchor -> button's right edge (140), gravity -> left, so the
+        // menu's right edge is at 140 and it extends left to -60.
+        assert_eq!(p.origin_x(true), -60, "flipped: right-aligned, extends left");
+    }
+
     /// `wl_shm` format codes map to the right `PixelFormat` + bytes-per-pixel:
     /// 8-bit BGRA (the default), 10-bit (4 bytes), float16 (8 bytes).
     #[test]
@@ -1848,6 +1967,8 @@ mod harness_tests {
         wp_viewport::WpViewport, wp_viewporter::WpViewporter,
     };
     use wayland_protocols::xdg::shell::client::{
+        xdg_popup::{self, XdgPopup},
+        xdg_positioner::XdgPositioner,
         xdg_surface::{self, XdgSurface},
         xdg_toplevel::XdgToplevel,
         xdg_wm_base::{self, XdgWmBase},
@@ -1893,6 +2014,9 @@ mod harness_tests {
         /// Set when a `wp_image_description_v1.ready` event arrives (the color
         /// description the client built was accepted by the compositor).
         image_desc_ready: bool,
+        /// Number of `xdg_popup.popup_done` events the client received — a menu
+        /// dismiss. Asserted by the popup-dismiss regression tests.
+        popup_done_count: u32,
     }
 
     /// The bound client proxies plus its connection/queue/state.
@@ -2053,6 +2177,36 @@ mod harness_tests {
             };
             self.pump();
             (surface, xdg, toplevel)
+        }
+
+        /// Create a grabbing popup on `parent_xdg` (as a context menu does) and
+        /// return its client proxy and the window id the compositor assigned it.
+        fn make_popup(
+            &mut self,
+            parent_xdg: &XdgSurface,
+            seat: &WlSeat,
+        ) -> (WlSurface, XdgPopup, u32) {
+            let (surface, popup) = {
+                let c = self.client();
+                let positioner = c.wm_base.create_positioner(&c.qh, ());
+                positioner.set_size(120, 200);
+                positioner.set_anchor_rect(0, 0, 10, 10);
+                let surface = c.compositor.create_surface(&c.qh, ());
+                let xdg = c.wm_base.get_xdg_surface(&surface, &c.qh, ());
+                let popup = xdg.get_popup(Some(parent_xdg), &positioner, &c.qh, ());
+                popup.grab(seat, 0);
+                surface.commit();
+                (surface, popup)
+            };
+            self.pump();
+            let window_id = self
+                .state
+                .popups
+                .values()
+                .next()
+                .expect("a popup exists")
+                .window_id;
+            (surface, popup, window_id)
         }
 
         /// Make an shm buffer in a pool of `pool_size` bytes (optionally resized to
@@ -2496,6 +2650,92 @@ mod harness_tests {
         );
     }
 
+    // === Popup dismissal ================================================
+
+    /// A click outside a grabbing menu (the pointer-grab path) tells the client
+    /// to dismiss it via `xdg_popup.popup_done` — once, even if the dismiss is
+    /// requested twice for the same menu.
+    #[test]
+    fn popup_dismiss_sends_popup_done_once() {
+        let mut h = Harness::new();
+        let (_surface, xdg, _tl) = h.make_toplevel();
+        let seat = h.client().seat.clone();
+        let (_psurf, _popup, popup_window) = h.make_popup(&xdg, &seat);
+
+        let dh = h.dh.clone();
+        h.state
+            .process_input(&dh, InputEvent::PopupDismiss { window_id: popup_window });
+        h.state
+            .process_input(&dh, InputEvent::PopupDismiss { window_id: popup_window });
+        h.pump();
+
+        assert_eq!(
+            h.client().cstate.popup_done_count,
+            1,
+            "exactly one popup_done per dismissed menu"
+        );
+    }
+
+    /// A grabbing menu is dismissed when the app is deactivated (the user clicks
+    /// another macOS app): no view receives that click, so the parent NSWindow's
+    /// resign-key path pushes a focus-out. Because focus sits on the popup, the
+    /// compositor sends `popup_done` rather than dropping the event — and only
+    /// once, even when the pointer-grab dismiss fires for the same click too.
+    #[test]
+    fn popup_dismissed_when_app_loses_focus() {
+        let mut h = Harness::new();
+        let (_surface, xdg, _tl) = h.make_toplevel();
+        let seat = h.client().seat.clone();
+        let parent_window = h.only_window_id();
+        let (_psurf, _popup, popup_window) = h.make_popup(&xdg, &seat);
+
+        let dh = h.dh.clone();
+        // Menu open: focus is on the popup, as create_popup sets for a grab.
+        h.state.process_input(
+            &dh,
+            InputEvent::Focus {
+                window_id: popup_window,
+                focused: true,
+            },
+        );
+        h.pump();
+        assert_eq!(h.client().cstate.popup_done_count, 0, "not dismissed yet");
+
+        // App deactivated: the parent NSWindow resigns key. Its focus-out must not
+        // be swallowed just because focus is on the popup — it dismisses the menu.
+        h.state.process_input(
+            &dh,
+            InputEvent::Focus {
+                window_id: parent_window,
+                focused: false,
+            },
+        );
+        h.pump();
+        assert_eq!(
+            h.client().cstate.popup_done_count,
+            1,
+            "menu dismissed when the app loses focus"
+        );
+
+        // A repeated focus-out and the pointer-grab dismiss (both can fire for one
+        // click that leaves the app) must not send a second popup_done.
+        h.state.process_input(
+            &dh,
+            InputEvent::Focus {
+                window_id: parent_window,
+                focused: false,
+            },
+        );
+        h.state
+            .process_input(&dh, InputEvent::PopupDismiss { window_id: popup_window });
+        h.pump();
+        assert_eq!(
+            h.client().cstate.popup_done_count,
+            1,
+            "dismiss stays idempotent"
+        );
+    }
+
     // === Regression #6: destroy / client-disconnect reaping ============
 
     /// An explicit `xdg_toplevel.destroy` emits exactly one Destroy (the request
@@ -2846,7 +3086,25 @@ mod harness_tests {
         }
     }
 
+    /// Counts `xdg_popup.popup_done` events so a test can assert a grabbing menu
+    /// was dismissed (and dismissed only once).
+    impl Dispatch<XdgPopup, ()> for CState {
+        fn event(
+            state: &mut Self,
+            _: &XdgPopup,
+            event: xdg_popup::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let xdg_popup::Event::PopupDone = event {
+                state.popup_done_count += 1;
+            }
+        }
+    }
+
     // Interfaces whose events the tests don't care about.
+    wayland_client::delegate_noop!(CState: ignore XdgPositioner);
     wayland_client::delegate_noop!(CState: ignore WlCompositor);
     wayland_client::delegate_noop!(CState: ignore WlSurface);
     wayland_client::delegate_noop!(CState: ignore WlShmPool);

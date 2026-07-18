@@ -309,10 +309,24 @@ module / TCP listener).
   a release goes to the surface that received the *press*, not the popup grab.
   Without it, the click that opens a menu also selects whatever item the popup maps
   under (newly visible since popups map in ~2ms after the nodelay fix).
-  Popups are **clamped onto the screen** (`create_popup` — the `xdg_positioner`
-  "slide" adjustment): a menu that would fall off an edge slides back into the
-  visible frame, so it isn't clipped and its click-outside dismiss hit-test still
-  works. (Full flip/resize adjustment isn't implemented.) Note: many app menus are
+  A grabbing menu is also dismissed when the whole app is **deactivated** — the
+  user clicks another macOS app or the desktop, so no view of ours receives the
+  click and the click-outside path can't fire. `windowDidResignKey` dismisses the
+  grabbed popup, and the parent's focus-out (`Focus{false}`) dismisses whatever
+  popup holds focus instead of being dropped as a stale leave (`dismiss_popup` is
+  idempotent via `PopupRec.dismissed`, so the two paths firing for one click send
+  a single `popup_done`). Fixes Firefox context menus lingering after clicking away.
+  Popups honor the `xdg_positioner` **constraint adjustment** to stay on-screen.
+  `set_constraint_adjustment` is read into `PositionerState`; the engine resolves
+  both the requested origin and a per-axis **flipped** candidate (anchor + gravity
+  inverted, `origin_x`/`origin_y`), and `create_popup` (which knows the parent's
+  on-screen position) picks the flipped placement when the requested one runs off
+  an edge and `flip_x`/`flip_y` is allowed — so e.g. Konsole's hamburger menu near
+  the right edge opens down-**left**, aligned under the button, instead of running
+  off the right (`constrain_axis`). A final **slide** clamps whatever remains into
+  the visible frame, so a menu is never clipped and its click-outside dismiss
+  hit-test still works. (`resize` adjustment isn't implemented; a popup larger than
+  the work area pins to the min edge.) Note: many app menus are
   NOT Wayland popups — e.g. Firefox's hamburger "AppMenu" is drawn in-content in the
   toplevel's own buffer, so it has no `xdg_popup`/grab and closes via a click the
   client receives, or on focus-out (`windowDidResignKey` → `Focus{false}`).

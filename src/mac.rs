@@ -701,6 +701,15 @@ define_class!(
         // because mouseExited only fires if the pointer physically leaves the view.
         #[unsafe(method(windowDidResignKey:))]
         fn window_did_resign_key(&self, _notif: &NSNotification) {
+            // If a popup is grabbing the pointer, the app losing key focus means the
+            // user clicked another macOS app or the desktop — a click no view of
+            // ours ever received, so the click-outside dismiss can't fire. Dismiss
+            // the menu here, the way a real compositor sends popup_done once the
+            // seat's focus leaves the surface stack. Without this a Firefox/GTK
+            // context menu stays on screen after you click away to another app.
+            if let Some(gid) = grabbed() {
+                push(InputEvent::PopupDismiss { window_id: gid });
+            }
             push(InputEvent::Focus {
                 window_id: self.ivars().window_id,
                 focused: false,
@@ -884,11 +893,17 @@ pub enum WinCmd {
     StartResize { id: u32, edges: u32 },
     /// Create a borderless popup window (menu/dropdown) positioned relative to
     /// its parent (logical/point coordinates, top-left of the parent surface).
+    /// `x_flip`/`y_flip` are the same origin with the positioner's anchor+gravity
+    /// inverted per axis, and `constraint` its `set_constraint_adjustment` bitmask;
+    /// together they let `create_popup` flip/slide the popup back on-screen.
     CreatePopup {
         id: u32,
         parent_id: u32,
         x: i32,
         y: i32,
+        x_flip: i32,
+        y_flip: i32,
+        constraint: u32,
         width: i32,
         height: i32,
     },
@@ -1379,9 +1394,23 @@ fn handle(cmd: WinCmd) {
             parent_id,
             x,
             y,
+            x_flip,
+            y_flip,
+            constraint,
             width,
             height,
-        } => create_popup(mtm, id, parent_id, x, y, width.max(1), height.max(1)),
+        } => create_popup(
+            mtm,
+            id,
+            parent_id,
+            x,
+            y,
+            x_flip,
+            y_flip,
+            constraint,
+            width.max(1),
+            height.max(1),
+        ),
         WinCmd::SetGrab { window } => {
             let was = GRAB.with(|g| g.replace(window));
             // Grab just ended: restore focus to the window under the cursor.
@@ -1851,14 +1880,45 @@ fn create_layer_window(
     info!(target: "mac", "created layer window {id} ({lw}x{lh} pts) anchor={anchor}");
 }
 
+/// Resolve one axis of `xdg_positioner` constraint adjustment. `pos` is the
+/// popup's un-flipped start on this axis, `flipped` the start with the anchor +
+/// gravity inverted, `size` its extent, and `[min, max]` the visible bounds. When
+/// `flip` is allowed and `pos` falls off an edge while `flipped` is fully
+/// on-screen, the flipped placement wins. A final slide keeps the popup on-screen
+/// regardless (pinning to the min edge if it is larger than the work area),
+/// matching the popup's original always-on-screen guarantee.
+fn constrain_axis(pos: f64, flipped: f64, size: f64, min: f64, max: f64, flip: bool) -> f64 {
+    let off_screen = |p: f64| p < min || p + size > max;
+    let mut pos = if flip && off_screen(pos) && !off_screen(flipped) {
+        flipped
+    } else {
+        pos
+    };
+    // Slide back in: pin the far edge, then the near edge (near wins if oversized).
+    if pos + size > max {
+        pos = max - size;
+    }
+    if pos < min {
+        pos = min;
+    }
+    pos
+}
+
 /// Create a borderless popup window (menu/dropdown) as a child of its parent,
 /// positioned at `(x, y)` logical points from the parent surface's top-left.
+/// `x_flip`/`y_flip` are the same origin with the positioner's anchor+gravity
+/// inverted per axis, and `constraint` its `set_constraint_adjustment` bitmask —
+/// used to flip/slide the popup back on-screen.
+#[allow(clippy::too_many_arguments)]
 fn create_popup(
     mtm: MainThreadMarker,
     id: u32,
     parent_id: u32,
     x: i32,
     y: i32,
+    x_flip: i32,
+    y_flip: i32,
+    constraint: u32,
     width: i32,
     height: i32,
 ) {
@@ -1866,36 +1926,50 @@ fn create_popup(
     let lw = (width / scale).max(1) as f64;
     let lh = (height / scale).max(1) as f64;
 
-    // Screen origin from the parent (macOS frames are bottom-left origin).
-    let (mut origin, parent_screen) = WINDOWS
+    // Screen origins from the parent (macOS frames are bottom-left origin): the
+    // requested placement and its per-axis flipped alternative.
+    let (mut origin, flip_origin, parent_screen) = WINDOWS
         .with(|w| {
             w.borrow().get(&parent_id).map(|p| {
                 let f = p.window.frame();
+                let top = f.origin.y + f.size.height;
                 (
-                    CGPoint::new(
-                        f.origin.x + x as f64,
-                        (f.origin.y + f.size.height) - y as f64 - lh,
-                    ),
+                    CGPoint::new(f.origin.x + x as f64, top - y as f64 - lh),
+                    CGPoint::new(f.origin.x + x_flip as f64, top - y_flip as f64 - lh),
                     p.window.screen(),
                 )
             })
         })
-        .unwrap_or((CGPoint::new(200.0, 200.0), None));
+        .unwrap_or((CGPoint::new(200.0, 200.0), CGPoint::new(200.0, 200.0), None));
 
-    // Constraint adjustment (slide): keep the whole popup on-screen. A client's
-    // xdg_positioner asks the compositor to flip/slide a menu that would fall off an
-    // edge; we slide it back into the visible area. Without this a tall menu (e.g.
-    // Firefox's hamburger) lands partly off the top edge — clipped, and its dismiss
-    // hit-test misses because the window isn't where the user sees it.
+    // Constraint adjustment: a client's xdg_positioner asks the compositor to
+    // flip/slide a menu that would fall off a screen edge. We prefer the flipped
+    // placement when the requested one runs off-screen (e.g. Konsole's hamburger
+    // menu near the right edge opens down-left, aligned under the button, instead
+    // of running off the right), then slide as a fallback so the whole popup stays
+    // visible. Without flipping, an edge-anchored menu opens on the wrong side of
+    // its button.
     let screen = parent_screen.or_else(|| NSScreen::mainScreen(mtm));
     if let Some(s) = screen {
         let vf = s.visibleFrame();
-        let max_x = vf.origin.x + vf.size.width - lw;
-        let max_y = vf.origin.y + vf.size.height - lh;
-        // Clamp to [min, max]; if the popup is larger than the work area, pin to the
-        // min edge (top-left) so its start is visible rather than its end.
-        origin.x = origin.x.min(max_x).max(vf.origin.x);
-        origin.y = origin.y.min(max_y).max(vf.origin.y);
+        const FLIP_X: u32 = 4;
+        const FLIP_Y: u32 = 8;
+        origin.x = constrain_axis(
+            origin.x,
+            flip_origin.x,
+            lw,
+            vf.origin.x,
+            vf.origin.x + vf.size.width,
+            constraint & FLIP_X != 0,
+        );
+        origin.y = constrain_axis(
+            origin.y,
+            flip_origin.y,
+            lh,
+            vf.origin.y,
+            vf.origin.y + vf.size.height,
+            constraint & FLIP_Y != 0,
+        );
     }
 
     // Use the WaylandWindow subclass so the popup can become key (menu keyboard
@@ -1970,7 +2044,12 @@ fn create_popup(
             focused: true,
         });
     }
-    info!(target: "mac", "created popup {id} under {parent_id} at ({x},{y}) {width}x{height}");
+    info!(
+        target: "mac",
+        "created popup {id} under {parent_id}: requested ({x},{y}) constraint={constraint:#b} \
+         -> screen origin ({:.0},{:.0}) {width}x{height}",
+        origin.x, origin.y,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2378,9 +2457,33 @@ fn expand_2101010_to_rgba16(width: i32, height: i32, stride: i32, pixels: &[u8])
 #[cfg(test)]
 mod tests {
     use super::{
-        bytes_per_pixel, cg_space_for, csd_margin, logical_size, make_cgimage, subsurface_origin,
-        CgSpace, ColorDesc, PixelFormat, Primaries, TransferFn,
+        bytes_per_pixel, cg_space_for, constrain_axis, csd_margin, logical_size, make_cgimage,
+        subsurface_origin, CgSpace, ColorDesc, PixelFormat, Primaries, TransferFn,
     };
+
+    /// `constrain_axis` implements the `xdg_positioner` flip/slide adjustment on
+    /// one axis. Screen bounds are `[0, 1000]` throughout; the popup is 300 wide.
+    #[test]
+    fn constrain_axis_flips_and_slides() {
+        // Fits already: no change (flipped candidate ignored).
+        assert_eq!(constrain_axis(100.0, 700.0, 300.0, 0.0, 1000.0, true), 100.0);
+
+        // Requested placement runs off the right edge (850..1150); the flipped
+        // candidate (550..850) is fully on-screen, so it wins — a right-edge menu
+        // opening leftward under its button.
+        assert_eq!(constrain_axis(850.0, 550.0, 300.0, 0.0, 1000.0, true), 550.0);
+
+        // Same overflow but flip not allowed: fall back to a slide that pins the
+        // far edge (1000 - 300 = 700).
+        assert_eq!(constrain_axis(850.0, 550.0, 300.0, 0.0, 1000.0, false), 700.0);
+
+        // Requested runs off-screen and the flipped candidate is *also* off-screen
+        // (e.g. -100): keep the requested side and slide it in (1000 - 600 = 400).
+        assert_eq!(constrain_axis(500.0, -100.0, 600.0, 0.0, 1000.0, true), 400.0);
+
+        // Larger than the work area: pin to the near (min) edge.
+        assert_eq!(constrain_axis(-50.0, -50.0, 1200.0, 0.0, 1000.0, false), 0.0);
+    }
 
     fn desc(tf: TransferFn, primaries: Primaries) -> ColorDesc {
         ColorDesc {

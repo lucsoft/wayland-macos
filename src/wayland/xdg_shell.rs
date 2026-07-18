@@ -80,6 +80,9 @@ impl Dispatch<XdgPositioner, ()> for State {
                     WEnum::Unknown(u) => u,
                 };
             }
+            xdg_positioner::Request::SetConstraintAdjustment {
+                constraint_adjustment,
+            } => entry.constraint_adjustment = constraint_adjustment.into(),
             _ => {}
         }
     }
@@ -152,6 +155,14 @@ impl Dispatch<XdgSurface, WlSurface> for State {
                 // parent surface). popup_origin needs the resolved size.
                 pos.size = (w, h);
                 let (x, y) = pos.popup_origin();
+                // The flipped candidate (anchor+gravity inverted on each axis),
+                // used by create_popup when the popup would fall off a screen edge.
+                let (x_flip, y_flip) = (pos.origin_x(true), pos.origin_y(true));
+                debug!(
+                    target: "wl",
+                    "popup positioner: anchor_rect={:?} anchor={} gravity={} offset={:?} size=({w},{h}) constraint={:#b} -> origin=({x},{y}) flipped=({x_flip},{y_flip})",
+                    pos.anchor_rect, pos.anchor, pos.gravity, pos.offset, pos.constraint_adjustment,
+                );
                 let parent_window = parent
                     .as_ref()
                     .and_then(|ps| ps.data::<WlSurface>())
@@ -170,10 +181,14 @@ impl Dispatch<XdgSurface, WlSurface> for State {
                         window_id,
                         x,
                         y,
+                        x_flip,
+                        y_flip,
+                        constraint: pos.constraint_adjustment,
                         w,
                         h,
                         configured: false,
                         created_window: false,
+                        dismissed: false,
                     },
                 );
                 state.surface_popup.insert(wl_surface.id(), popup.id());
