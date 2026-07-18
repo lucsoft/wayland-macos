@@ -380,15 +380,19 @@ impl WaylandView {
     fn motion(&self, ev: &NSEvent) {
         let (x, y) = self.local(ev);
         let id = self.ivars().window_id.get();
-        // Log only when motion switches to a different window (low noise): shows
-        // whether the toolbar (parent) keeps receiving motion vs. it jumping to a
-        // tooltip/popup window.
-        LAST_MOTION_WIN.with(|c| {
-            if c.get() != Some(id) {
-                c.set(Some(id));
-                debug!(target: "mac", "motion now on window {id}");
+        // Rate-limited (~200ms) so a single test shows whether motion keeps
+        // flowing and to which window, without flooding the log.
+        let now = std::time::Instant::now();
+        let should_log = LAST_MOTION_LOG.with(|c| {
+            let ok = c.get().is_none_or(|t| now.duration_since(t).as_millis() >= 200);
+            if ok {
+                c.set(Some(now));
             }
+            ok
         });
+        if should_log {
+            debug!(target: "mac", "motion window {id} ({x:.0},{y:.0})");
+        }
         push(InputEvent::PointerMotion { window_id: id, x, y });
     }
 
@@ -1099,8 +1103,8 @@ thread_local! {
     // release onto a menu item — route the release to the grabbing popup so the
     // item activates).
     static IMPLICIT_GRAB_ORIGIN: Cell<Option<CGPoint>> = const { Cell::new(None) };
-    // Last window motion was routed to (debug: detect motion switching windows).
-    static LAST_MOTION_WIN: Cell<Option<u32>> = const { Cell::new(None) };
+    // Rate-limit for the debug motion log (see WaylandView::motion).
+    static LAST_MOTION_LOG: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
     // The cursor the focused client last requested (via wp_cursor_shape); applied
     // through the view's cursor rects.
     static CURSOR: RefCell<Option<Retained<NSCursor>>> = const { RefCell::new(None) };
