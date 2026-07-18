@@ -86,7 +86,10 @@ bridge.
 | `src/host.rs` | `--multiplex` mode (child side): `--window-host <sock>` entry — its own `NSApplication` (its own Dock tile / Cmd-Tab entry) running the normal AppKit `handle()` path over a socket. |
 | `src/ipc.rs` | Wire format for the two above: length-prefixed `bincode` frames (`Downlink`/`Uplink`) over a `UnixStream`. |
 | `src/bin/testclient.rs` | Standalone `wayland-client` test client. |
-| `build.rs` | Points the linker at Homebrew's libxkbcommon. |
+| `src/rail.rs` | **RAIL back-end** (`--features rail`, the WSLg-style alternative to the whole `src/wayland/` engine): the RDP/RAIL *client* — starts the `csrc/` FreeRDP bridge, turns its window/surface callbacks into `WinCmd`, and forwards input. Same `mac::post`/`InputBus` seam as the Wayland back-end. |
+| `src/rail_route.rs` | Pure, headlessly unit-tested RAIL windowing *policy* (window classification incl. shadow-frame demotion + surface→window routing) called from the C bridge — keeps the transport thin and the decisions testable. |
+| `csrc/rail_bridge.{c,h}` | C bridge to the FreeRDP fork: runs the RDP event loop, decodes RAIL window orders + rdpgfx surfaces into the `rail_callbacks`, and sends input. |
+| `build.rs` | Points the linker at Homebrew's libxkbcommon; for a `--features rail` build, compiles `csrc/rail_bridge.c` and links **Microsoft's FreeRDP 2.x fork** — the WSLg RAIL/VAIL server extensions, *not* upstream FreeRDP 3 (which can't speak WSLg's RAIL stream). Build it with `scripts/build-msfreerdp.sh`; it installs to `~/.local/msfreerdp` (override via `MSFREERDP_PREFIX`), and `build.rs` finds it through `pkg-config` (`freerdp2`/`freerdp-client2`/`winpr2`). |
 | `docker/` | Container images + `entrypoint.sh` (see Containers). |
 | `scripts/` | `run.sh` (bring up the Mac side + launch a container app), `pulseaudio-mac.sh`/`.pa` (audio bridge), `build-waypipe.sh`, `build-msfreerdp.sh` (rail), `e2e-resize-kwin.sh`. Bring-up/teardown itself is `cargo run` / `cargo run -- stop`. |
 
