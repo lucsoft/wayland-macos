@@ -1361,18 +1361,10 @@ impl State {
                     return;
                 }
                 if !focused && self.focus_window != Some(window_id) {
-                    // A focus-out for a window that doesn't currently hold focus
-                    // usually just means a redundant leave — drop it. But if focus
-                    // sits on a popup, this is the app being deactivated (the user
-                    // clicked another macOS app) while a menu is open: the parent
-                    // NSWindow resigns key, but the click never reached any of our
-                    // views, so the pointer-grab dismiss can't fire. Dismiss the
-                    // popup here so Firefox/GTK menus don't linger on screen.
-                    if let Some(fw) = self.focus_window {
-                        if self.popups.values().any(|p| p.window_id == fw) {
-                            self.dismiss_popup(fw);
-                        }
-                    }
+                    // A focus-out for a window that doesn't hold focus is a stale
+                    // leave — drop it. (Dismissing an open popup on app-deactivation
+                    // is handled by AppDeactivated, which — unlike this path — does
+                    // NOT also fire on an ordinary pointer leave.)
                     return;
                 }
                 let Some(surface) = self.window_surface.get(&window_id).cloned() else {
@@ -1465,6 +1457,18 @@ impl State {
                 // Click outside a grabbing menu (or the app was deactivated with a
                 // menu open): tell the client to dismiss it.
                 self.dismiss_popup(window_id);
+            }
+            InputEvent::AppDeactivated { window_id: _ } => {
+                // The app was deactivated (user clicked another app / window / the
+                // desktop). If a popup currently holds focus, its dismissing click
+                // never reached any of our views, so dismiss the menu now. Fires
+                // only on a real deactivation (windowDidResignKey), never on a
+                // pointer leave, so it doesn't kill a menu that opened at the cursor.
+                if let Some(fw) = self.focus_window {
+                    if self.popups.values().any(|p| p.window_id == fw) {
+                        self.dismiss_popup(fw);
+                    }
+                }
             }
             // TODO(clipboard): placeholder so the build stays exhaustive; the
             // pasteboard->selection logic lives elsewhere / is WIP.
@@ -2707,11 +2711,10 @@ mod harness_tests {
         );
     }
 
-    /// A grabbing menu is dismissed when the app is deactivated (the user clicks
-    /// another macOS app): no view receives that click, so the parent NSWindow's
-    /// resign-key path pushes a focus-out. Because focus sits on the popup, the
-    /// compositor sends `popup_done` rather than dropping the event — and only
-    /// once, even when the pointer-grab dismiss fires for the same click too.
+    /// A menu holding focus is dismissed when the app is deactivated (the user
+    /// clicks another macOS app): no view receives that click, so the toplevel's
+    /// resign-key path pushes `AppDeactivated` and the compositor sends
+    /// `popup_done` — once, even if a redundant deactivation / grab-dismiss follows.
     #[test]
     fn popup_dismissed_when_app_loses_focus() {
         let mut h = Harness::new();
@@ -2732,31 +2735,19 @@ mod harness_tests {
         h.pump();
         assert_eq!(h.client().cstate.popup_done_count, 0, "not dismissed yet");
 
-        // App deactivated: the parent NSWindow resigns key. Its focus-out must not
-        // be swallowed just because focus is on the popup — it dismisses the menu.
-        h.state.process_input(
-            &dh,
-            InputEvent::Focus {
-                window_id: parent_window,
-                focused: false,
-            },
-        );
+        // App deactivated: the toplevel's NSWindow resigns key.
+        h.state
+            .process_input(&dh, InputEvent::AppDeactivated { window_id: parent_window });
         h.pump();
         assert_eq!(
             h.client().cstate.popup_done_count,
             1,
-            "menu dismissed when the app loses focus"
+            "menu dismissed when the app is deactivated"
         );
 
-        // A repeated focus-out and the pointer-grab dismiss (both can fire for one
-        // click that leaves the app) must not send a second popup_done.
-        h.state.process_input(
-            &dh,
-            InputEvent::Focus {
-                window_id: parent_window,
-                focused: false,
-            },
-        );
+        // A repeated deactivation / grab-dismiss for the same click stays idempotent.
+        h.state
+            .process_input(&dh, InputEvent::AppDeactivated { window_id: parent_window });
         h.state
             .process_input(&dh, InputEvent::PopupDismiss { window_id: popup_window });
         h.pump();
@@ -2764,6 +2755,46 @@ mod harness_tests {
             h.client().cstate.popup_done_count,
             1,
             "dismiss stays idempotent"
+        );
+    }
+
+    /// A plain focus-out (an ordinary pointer leave — e.g. a menu opening under the
+    /// cursor makes the toplevel's view report mouseExited) must NOT dismiss a
+    /// popup that holds focus. Only `AppDeactivated` does. Regression: a non-
+    /// grabbing context menu that "flashed and vanished" the instant it opened.
+    #[test]
+    fn pointer_leave_does_not_dismiss_focused_popup() {
+        let mut h = Harness::new();
+        let (_surface, xdg, _tl) = h.make_toplevel();
+        let seat = h.client().seat.clone();
+        let parent_window = h.only_window_id();
+        let (_psurf, _popup, popup_window) = h.make_popup(&xdg, &seat);
+
+        let dh = h.dh.clone();
+        // Menu open under the cursor: focus moves to the popup.
+        h.state.process_input(
+            &dh,
+            InputEvent::Focus {
+                window_id: popup_window,
+                focused: true,
+            },
+        );
+        h.pump();
+
+        // The toplevel reports a pointer leave (mouseExited) right after the popup
+        // mapped over the cursor. This must be dropped, not treated as a dismiss.
+        h.state.process_input(
+            &dh,
+            InputEvent::Focus {
+                window_id: parent_window,
+                focused: false,
+            },
+        );
+        h.pump();
+        assert_eq!(
+            h.client().cstate.popup_done_count,
+            0,
+            "a pointer leave must not dismiss the popup"
         );
     }
 

@@ -736,19 +736,15 @@ define_class!(
         // because mouseExited only fires if the pointer physically leaves the view.
         #[unsafe(method(windowDidResignKey:))]
         fn window_did_resign_key(&self, _notif: &NSNotification) {
-            // If a popup is grabbing the pointer, the app losing key focus means the
-            // user clicked another macOS app or the desktop — a click no view of
-            // ours ever received, so the click-outside dismiss can't fire. Dismiss
-            // the menu here, the way a real compositor sends popup_done once the
-            // seat's focus leaves the surface stack. Without this a Firefox/GTK
-            // context menu stays on screen after you click away to another app.
-            if let Some(gid) = grabbed() {
-                push(InputEvent::PopupDismiss { window_id: gid });
-            }
-            push(InputEvent::Focus {
-                window_id: self.ivars().window_id,
-                focused: false,
-            });
+            // The app lost key focus (clicked another app / our other window / the
+            // desktop). Signal a *real* deactivation so the engine can dismiss an
+            // open menu whose dismissing click never reached any of our views. This
+            // is deliberately NOT the pointer-leave path: a popup opening under the
+            // cursor fires mouseExited on the toplevel, and treating that as
+            // deactivation would kill the popup the instant it appears.
+            let id = self.ivars().window_id;
+            push(InputEvent::AppDeactivated { window_id: id });
+            push(InputEvent::Focus { window_id: id, focused: false });
         }
         #[unsafe(method(windowDidResize:))]
         fn window_did_resize(&self, notif: &NSNotification) {

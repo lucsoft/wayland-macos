@@ -116,6 +116,12 @@ pub enum InputEvent {
     Modifiers { depressed: u32, locked: u32 },
     /// Keyboard focus gained/lost for a window.
     Focus { window_id: u32, focused: bool },
+    /// The whole app lost key focus (the user clicked another macOS app, another
+    /// of our windows, or the desktop). Distinct from `Focus{focused:false}`,
+    /// which also fires on an ordinary pointer leave — this fires ONLY on real
+    /// deactivation, so it can dismiss an open menu without killing a popup that
+    /// just opened under the cursor (whose open triggers a toplevel mouseExited).
+    AppDeactivated { window_id: u32 },
     /// The user resized the NSWindow; ask the client to repaint at this size
     /// (logical/surface units).
     Resize { window_id: u32, width: i32, height: i32 },
