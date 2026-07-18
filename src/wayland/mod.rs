@@ -1340,8 +1340,10 @@ impl State {
                 // Ignore a stale leave if we already moved focus elsewhere (e.g.
                 // the synthetic enter for a popup already left this surface).
                 if self.pointer_focus != Some(window_id) {
+                    debug!(target: "wl", "pointer leave window {window_id} DROPPED (focus={:?})", self.pointer_focus);
                     return;
                 }
+                debug!(target: "wl", "pointer leave window {window_id} -> sent");
                 let Some(surface) = self.window_surface.get(&window_id).cloned() else {
                     return;
                 };

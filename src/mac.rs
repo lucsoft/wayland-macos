@@ -298,6 +298,7 @@ define_class!(
             let id = self.ivars().window_id.get();
             // Pointer enter only — keyboard focus is click-to-focus (see
             // windowDidBecomeKey), it does NOT follow the pointer.
+            debug!(target: "mac", "pointer ENTER window {id}");
             push(InputEvent::PointerEnter { window_id: id, x, y });
         }
         #[unsafe(method(mouseExited:))]
@@ -306,6 +307,7 @@ define_class!(
                 return;
             }
             let id = self.ivars().window_id.get();
+            debug!(target: "mac", "pointer EXIT window {id}");
             push(InputEvent::PointerLeave { window_id: id });
         }
         #[unsafe(method(mouseDown:))]
